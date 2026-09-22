@@ -77,9 +77,13 @@ class DynSys():
         return self.solver.inc_proj(U)
 
     def write_fields(self, U, idx, path):
-        ''' Writes fields to binary file'''
+        ''' Writes fields to file'''
         fields = self.unflatten(U)
-        return self.solver.write_fields(fields, idx, path)
+        if hasattr(self.solver, 'write_fields'):
+            return self.solver.write_fields(fields, path=path, idx=idx)
+        # Pseudo-spectral solvers save through outs, which expects Fourier-space fields
+        fields = [self.grid.forward(f) for f in fields]
+        return self.solver.outs(fields, idx, path)
 
     def phase_shifted_b(self, fields):
         """Generate b vector by modifying phases in Fourier space."""
@@ -281,6 +285,7 @@ class DynSys():
             # Initial run
             U = self.flatten(fields)
             le_sum = np.zeros(n)
+            np.random.seed(42)
             if isinstance(b, str):
                 if b == 'U':
                     b = U.copy()
@@ -857,11 +862,16 @@ class ArclengthNewtonSolver(UPONewtonSolver):
             print(content, file=open(path, "a"))
 
     def update_lda(self, lda):
-        '''Updates lambda parameter in solver. norm: normalization parameter'''
+        '''Updates the continuation parameter lambda in the solver.
+        lda is Re for KolmogorovFlow and Ra/norm_val for BOUSS.
+
+        Note: with the JAX backend rkstep is jitted with self static, so
+        parameter updates may not invalidate the compiled cache. Run
+        arclength continuation with the NumPy backend.'''
         if self.solver.solver == 'KolmogorovFlow':
-            self.solver.pm.nu = 1 / lda  # Assigning directly to solver's pm since self.pm is removed
+            self.solver.nu = 1 / lda
         elif self.solver.solver == 'BOUSS':
-            self.solver.pm.ra = lda * self.norm_val
+            self.solver.ra = lda * self.norm_val
         else:
             raise Exception('Arclength only implemented for Kolmogorov and BOUSS')
 
@@ -904,7 +914,7 @@ class ArclengthNewtonSolver(UPONewtonSolver):
 
         def apply_A(dX):
             dU, dT, ds, dlda_val = self.unpack_X(dX)
-            epsilon = 1e-7 * self.norm(U) / self.norm(dU)
+            epsilon = self.eps0 * self.norm(U) / self.norm(dU)
             U_pert = self.apply_proj(U, epsilon * dU, self.sp1)
 
             dUT_dU = self.evolve(U_pert, T)
@@ -931,10 +941,17 @@ class ArclengthNewtonSolver(UPONewtonSolver):
         return apply_A, UT
 
     def run_arclength(self, X0, X1, X_restart=None, iA: int | None = None):
-        """Run Newton iterations for one arclength step from X0 to a new solution near X1."""
+        """Run Newton iterations for one arclength step: starting from the two
+        previous converged solutions X0 and X1, converge to a new solution at
+        arclength distance ~dr further along the branch (Chandler & Kerswell 2013)."""
         dr = np.linalg.norm(X1 - X0)
         dX_dr = (X1 - X0) / dr
-        X = X_restart if X_restart is not None else X1
+
+        if X_restart is not None:
+            X = X_restart
+        else:
+            # Linear extrapolation predictor along the branch: satisfies N(X) = 0
+            X = X1 + dr * self.alpha**2 * dX_dr
 
         start_iN = self.restart_iN + 1 if (iA == self.restart_iA) else 1
 
@@ -945,7 +962,8 @@ class ArclengthNewtonSolver(UPONewtonSolver):
 
             N = self.N_constraint(X, dX_dr, dr, X1)
             b = np.append(b, -N)
-            F = self.norm(b[:-1])
+            # Full residual of the extended system, consistent with F_new from hookstep
+            F = self.norm(b)
 
             self.write_newton(iN, F, U, sx, T, (lda * self.norm_val, N), iA)
             self.write_headers(iN, iA)
@@ -964,13 +982,18 @@ class ArclengthNewtonSolver(UPONewtonSolver):
                 b = self.form_b(U, UT)
                 N = self.N_constraint(X, dX_dr, dr, X1)
                 b = np.append(b, -N)
-                F = self.norm(b[:-1])
-                
+                F = self.norm(b)
+
                 self.write_newton(iN + 1, F, U, sx, T, (lda * self.norm_val, N), iA)
 
                 if iA is not None:
                     self.save_converged(X, iA)
                 return X
+
+        raise RuntimeError(
+            f'Arclength Newton iteration did not converge in {self.N_newt} iterations'
+            + (f' (iA={iA})' if iA is not None else '')
+        )
 
     def run_arc_auto(self, X0, X1, X_restart=None):
         """Automate successive arclength continuation steps, using each converged solution as the next predictor."""
@@ -988,11 +1011,12 @@ class ArclengthNewtonSolver(UPONewtonSolver):
     def save_converged(self, X, iA):
         """Save converged solution fields and scalar parameters to the converged directory."""
         U, T, sx, lda = self.unpack_X(X)
-        path = self._get_path(self.converged_dir, "solver.txt", iA=iA)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        path = self._get_path(self.converged_dir, "solver.txt")
+        if path is None:
+            return
 
-        if iA == 0 and not os.path.exists(path):
+        if not os.path.exists(path):
             print("iA, T, sx, lda, |U|", file=open(path, "a"))
 
         print(f"{iA:02},{T},{sx:.8e},{lda * self.norm_val},{self.norm(U):.6e}", file=open(path, "a"))
-        self.write_fields(U, idx=0, path=os.path.dirname(path))
+        self.write_fields(U, idx=iA, path=os.path.dirname(path))
