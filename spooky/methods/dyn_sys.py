@@ -202,7 +202,10 @@ class DynSys():
         return_hist=False,
         resume=False,
         checkpoint_file=None,
-        checkpoint_every=None
+        checkpoint_every=None,
+        store_dir=None,
+        store_Q_every=None,
+        store_Q_max=None,
         ):
         ''' Computes Lyapunov exponents and Kaplan–Yorke dimension via QR iteration.
 
@@ -210,10 +213,16 @@ class DynSys():
         Lyapunov exponents by repeatedly evolving a set of orthonormal perturbations
         over intervals of duration T and reorthonormalizing them using QR decomposition.
 
+        With `store_dir` it is also the forward pass of the Ginelli et al. (2007)
+        algorithm for covariant Lyapunov vectors: the QR factors of step k
+        (J_T Q_{k-1} = Q_k R_k, t_k = k T) are written to disk and
+        `covariant_lyapunov_vectors` runs the backward recursion on them.
+
         Parameters
         ----------
         fields : list of fields
-            Initial fields defining the state U.
+            Initial fields defining the state U. Not used when resuming from a
+            checkpoint (the state is read from it), so it may be None then.
         T : float
             Integration time between QR reorthonormalizations.
         n : int
@@ -236,6 +245,18 @@ class DynSys():
             Path to checkpoint file for saving and resuming. If None, no checkpointing is done.
         checkpoint_every : int or None, optional
             If not None, saves a checkpoint every this many steps. Ignored if checkpoint_file is None.
+        store_dir : str or None, optional
+            If given, after every QR step k (1-based: k = step + 1, so t_k = k T and
+            le_hist[k-1] is the estimate at t_k) the triangular factor R_k is written
+            to `<store_dir>/R_{k:05d}.npy`. The basis Q_k and the state U_k at the
+            same instant go to `Q_{k:05d}.npy` / `U_{k:05d}.npy` when k is a multiple
+            of `store_Q_every` (and k <= `store_Q_max`, if set). Step numbers continue
+            across resumes, so a resumed run extends the same store.
+        store_Q_every : int or None, optional
+            Store Q_k (and U_k) every this many steps; None stores no Q at all.
+        store_Q_max : int or None, optional
+            Do not store Q_k beyond this step (the backward transient of the CLV
+            recursion makes late steps useless, so their Q need not be kept).
 
         Returns
         -------
@@ -336,6 +357,16 @@ class DynSys():
 
             t = (step + 1) * T
 
+            # Ginelli forward pass: keep the QR factors of this step (k = step + 1)
+            if store_dir is not None:
+                k = step + 1
+                os.makedirs(store_dir, exist_ok=True)
+                np.save(os.path.join(store_dir, f'R_{k:05d}.npy'), R)
+                if (store_Q_every is not None and k % store_Q_every == 0
+                        and (store_Q_max is None or k <= store_Q_max)):
+                    np.save(os.path.join(store_dir, f'Q_{k:05d}.npy'), Q)
+                    np.save(os.path.join(store_dir, f'U_{k:05d}.npy'), Uevol)
+
             if return_hist:
                 le_hist[step, :] = le_sum / t
 
@@ -404,6 +435,115 @@ class DynSys():
         le_hist = le_hist[:, sort_idx]
 
         return lyap_exponents, D_KY, le_hist
+
+
+def covariant_lyapunov_vectors(store_dir, k_lo=None, k_hi=None, n_back=None,
+                               load_Q=True, seed=0, verbose=True):
+    ''' Covariant Lyapunov vectors (CLVs) by the backward pass of Ginelli et al.,
+    PRL 99, 130601 (2007), from the QR factors stored by `DynSys.lyapunov_exponents`
+    (`store_dir`). Pure numpy: no solver is needed.
+
+    The forward pass gives J_T Q_{k-1} = Q_k R_k (t_k = k T). Writing the j-th CLV
+    in the Gram-Schmidt basis, v_j(t_k) = Q_k c_k^{(j)}, covariance
+    J_T v_j(t_{k-1}) ∝ v_j(t_k) becomes R_k c_{k-1} ∝ c_k, i.e.
+
+        c_{k-1} = R_k^{-1} c_k / ||R_k^{-1} c_k||        (backward recursion)
+
+    v_j lies in span(Q_k[:, :j]) (backward Oseledets filtration), so the coefficient
+    matrix C_k = [c^{(1)} ... c^{(n)}] is upper triangular and stays so. Starting from
+    an arbitrary upper-triangular C at k_hi and iterating down, C_k converges to the
+    CLV coefficients after a backward transient: only k <= k_hi - n_back is trusted.
+    The log growth of CLV j across step k, g_k^{(j)} = log||R_k c_{k-1}|| =
+    -log||R_k^{-1} c_k||, averaged over the trusted window and divided by T, must
+    reproduce lambda_j; this is the convergence check.
+
+    Parameters
+    ----------
+    store_dir : str
+        Directory holding R_{k:05d}.npy for every k and Q_{k:05d}.npy for some k.
+    k_lo, k_hi : int or None
+        Steps to process: R_k is used for k_lo < k <= k_hi and C_k is returned for
+        k_lo <= k <= k_hi. Default: every R present.
+    n_back : int or None
+        Backward transient in steps; default 40% of (k_hi - k_lo).
+    load_Q : bool
+        Also form V_k = Q_k C_k for every stored Q_k with k_lo <= k <= k_hi - n_back.
+    seed : int
+        Seed of the random upper-triangular start at k_hi.
+
+    Returns
+    -------
+    dict with
+        steps   : (K+1,) ints k_lo .. k_hi
+        C       : (K+1, n, n) unit-column upper-triangular coefficients, C[i] at steps[i]
+        growth  : (K, n) g_k for k = steps[1:], row i <-> step steps[i+1]
+        angles  : (K+1, n, n) angles between CLVs, arccos|c_i . c_j| (Q is orthonormal)
+        k_valid : largest trusted step, k_hi - n_back
+        n_back  : the transient used
+        vectors : {k: (N, n) array} V_k = Q_k C_k for stored, trusted k (if load_Q)
+    '''
+    import re
+    import glob
+    try:
+        from scipy.linalg import solve_triangular
+        _solve = lambda R, C: solve_triangular(R, C)
+    except ImportError:                                   # keep C triangular by hand
+        _solve = lambda R, C: np.triu(np.linalg.solve(R, C))
+
+    ks = {}
+    for f in glob.glob(os.path.join(store_dir, 'R_*.npy')):
+        m = re.search(r'R_(\d+)\.npy$', f)
+        if m:
+            ks[int(m.group(1))] = f
+    if not ks:
+        raise FileNotFoundError(f'no R_*.npy in {store_dir}')
+    if k_hi is None:
+        k_hi = max(ks)
+    if k_lo is None:
+        k_lo = min(ks) - 1
+    missing = [k for k in range(k_lo + 1, k_hi + 1) if k not in ks]
+    if missing:
+        raise FileNotFoundError(f'{store_dir}: missing R for steps {missing[:5]}...')
+
+    K = k_hi - k_lo
+    if n_back is None:
+        n_back = int(round(0.4 * K))
+    n = np.load(ks[k_hi]).shape[0]
+
+    rng = np.random.default_rng(seed)
+    C = np.triu(rng.random((n, n)) + 0.5)                 # positive diagonal: safe start
+    C /= np.linalg.norm(C, axis=0)
+
+    C_hist = np.zeros((K + 1, n, n))
+    growth = np.zeros((K, n))
+    C_hist[K] = C
+    for k in range(k_hi, k_lo, -1):
+        X = _solve(np.load(ks[k]), C)                      # R_k^{-1} C_k
+        norms = np.linalg.norm(X, axis=0)
+        growth[k - k_lo - 1] = -np.log(norms)              # growth across step k
+        C = X / norms
+        C_hist[k - k_lo - 1] = C
+
+    cos = np.abs(np.einsum('kij,kil->kjl', C_hist, C_hist))
+    angles = np.arccos(np.clip(cos, 0.0, 1.0))
+
+    k_valid = k_hi - n_back
+    out = dict(steps=np.arange(k_lo, k_hi + 1), C=C_hist, growth=growth, angles=angles,
+               k_valid=k_valid, n_back=n_back, vectors={})
+    if load_Q:
+        for f in sorted(glob.glob(os.path.join(store_dir, 'Q_*.npy'))):
+            m = re.search(r'Q_(\d+)\.npy$', f)
+            k = int(m.group(1)) if m else None
+            if k is None or k < k_lo or k > k_valid:
+                continue
+            out['vectors'][k] = np.load(f) @ C_hist[k - k_lo]
+    if verbose:
+        lam_clv = growth[:max(k_valid - k_lo, 1)].mean(axis=0)
+        print(f'CLV backward pass: steps {k_lo}..{k_hi}, trusted <= {k_valid}, '
+              f'mean log-growth per step over trusted window: {np.array2string(lam_clv, precision=4)}; '
+              f'{len(out["vectors"])} vector sets formed')
+    return out
+
 
 class UPONewtonSolver(DynSys):
     """
