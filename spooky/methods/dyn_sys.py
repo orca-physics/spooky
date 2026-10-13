@@ -989,7 +989,7 @@ class UPONewtonSolver(DynSys):
             if F_new <= lin_exp:
                 break
             else:
-                Delta *= self.reduc_reg
+                Delta = self.shrink_Delta(Delta, y)
         self.hook_done(y, iH, F_new <= lin_exp)
         return X_new, F_new, UT
 
@@ -1007,6 +1007,12 @@ class UPONewtonSolver(DynSys):
         iteration starts again from the full Newton step) instead of keeping the last, shrunken one."""
         if self.mu_search:
             self._Delta_prev = self.norm(y) * (self.delta_inc if iH == 0 else 1.) if accepted else None
+
+    def shrink_Delta(self, Delta, y):
+        """Trust radius after rejecting the trial step y: ``reduc_reg`` times the smaller of Delta and |y|.
+        In the default mode |y| can lie far below Delta (mu only grows), and shrinking Delta alone would
+        return the same, already rejected y until Delta drops below |y|."""
+        return self.reduc_reg * min(Delta, self.norm(y))
 
     def search_mu(self, y_of, Delta, s, rtol=0.1, n_bisect=60):
         """mu > 0 with (1 - rtol) Delta <= |y(mu)| <= Delta, by bisection in log(mu) (|y(mu)| decreases
@@ -1189,7 +1195,7 @@ class ArclengthNewtonSolver(UPONewtonSolver):
                 # without evolving (the solver cannot be built there) and shrink the trust region
                 F_new, lin_exp = np.inf, self.norm(beta - self.c * H @ y)
                 self.write_hookstep(iN, iH, F_new, lin_exp, arclength["iA"])
-                Delta *= self.reduc_reg
+                Delta = self.shrink_Delta(Delta, y)
                 continue
             self.update_lda(lda_new)
 
@@ -1207,7 +1213,7 @@ class ArclengthNewtonSolver(UPONewtonSolver):
             if F_new <= lin_exp:
                 break
             else:
-                Delta *= self.reduc_reg
+                Delta = self.shrink_Delta(Delta, y)
         self.hook_done(y, iH, F_new <= lin_exp)
         return X_new, F_new, UT
 
