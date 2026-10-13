@@ -522,6 +522,9 @@ class DynSys():
             # batched tangent map: exact linearized pass under JAX,
             # FD column loop under NumPy (see tangent_map_batch)
             Uevol, V = self.tangent_map_batch(U, Q, T, sx=sx, ep0=ep0)
+            # the tangent images V are post-mapped (translated by sx, then sym): carry the base point
+            # along, so that the next tangent map is evaluated at the point the vectors in Q belong to
+            Uevol = self.post_map(Uevol, sx)
 
             Q, R = np.linalg.qr(V)
 
