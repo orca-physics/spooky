@@ -935,7 +935,8 @@ class UPONewtonSolver(DynSys):
             self.write_header_newton()
         self._Delta_prev = None
 
-        for iN in range(self.restart_iN+1, self.N_newt):
+        # N_newt is the total number of iterations (restart_iN of them already done)
+        for iN in range(self.restart_iN+1, self.N_newt+1):
             U, T, sx = self.unpack_X(X)
             apply_A, UT = self.update_A(X, iN)
             b = self.form_b(U, UT)
@@ -1345,7 +1346,7 @@ class ArclengthNewtonSolver(UPONewtonSolver):
         start_iN = self.restart_iN + 1 if (iA == self.restart_iA) else 1
         self._Delta_prev = None
 
-        for iN in range(start_iN, self.N_newt):
+        for iN in range(start_iN, self.N_newt+1):
             U, T, sx, lda = self.unpack_X(X)
             apply_A, UT = self.update_A_arc(X, dX_dr, iN, iA)
             b = self.form_b(U, UT)
