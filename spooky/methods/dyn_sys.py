@@ -116,9 +116,13 @@ class DynSys():
         return self.solver.inc_proj(U)
 
     def write_fields(self, U, idx, path):
-        ''' Writes fields to binary file'''
+        ''' Writes fields to file'''
         fields = self.unflatten(U)
-        return self.solver.write_fields(fields, idx, path)
+        if hasattr(self.solver, 'write_fields'):
+            return self.solver.write_fields(fields, path=path, idx=idx)
+        # Pseudo-spectral solvers save through outs, which expects Fourier-space fields
+        fields = [self.grid.forward(f) for f in fields]
+        return self.solver.outs(fields, idx, path)
 
     # --- AD methods (require JAX backend) ------------------------------------
 
@@ -382,7 +386,10 @@ class DynSys():
         return_hist=False,
         resume=False,
         checkpoint_file=None,
-        checkpoint_every=None
+        checkpoint_every=None,
+        store_dir=None,
+        store_Q_every=None,
+        store_Q_max=None,
         ):
         ''' Computes Lyapunov exponents and Kaplan–Yorke dimension via QR iteration.
 
@@ -390,10 +397,16 @@ class DynSys():
         Lyapunov exponents by repeatedly evolving a set of orthonormal perturbations
         over intervals of duration T and reorthonormalizing them using QR decomposition.
 
+        With `store_dir` it is also the forward pass of the Ginelli et al. (2007)
+        algorithm for covariant Lyapunov vectors: the QR factors of step k
+        (J_T Q_{k-1} = Q_k R_k, t_k = k T) are written to disk and
+        `covariant_lyapunov_vectors` runs the backward recursion on them.
+
         Parameters
         ----------
         fields : list of fields
-            Initial fields defining the state U.
+            Initial fields defining the state U. Not used when resuming from a
+            checkpoint (the state is read from it), so it may be None then.
         T : float
             Integration time between QR reorthonormalizations.
         n : int
@@ -416,6 +429,18 @@ class DynSys():
             Path to checkpoint file for saving and resuming. If None, no checkpointing is done.
         checkpoint_every : int or None, optional
             If not None, saves a checkpoint every this many steps. Ignored if checkpoint_file is None.
+        store_dir : str or None, optional
+            If given, after every QR step k (1-based: k = step + 1, so t_k = k T and
+            le_hist[k-1] is the estimate at t_k) the triangular factor R_k is written
+            to `<store_dir>/R_{k:05d}.npy`. The basis Q_k and the state U_k at the
+            same instant go to `Q_{k:05d}.npy` / `U_{k:05d}.npy` when k is a multiple
+            of `store_Q_every` (and k <= `store_Q_max`, if set). Step numbers continue
+            across resumes, so a resumed run extends the same store.
+        store_Q_every : int or None, optional
+            Store Q_k (and U_k) every this many steps; None stores no Q at all.
+        store_Q_max : int or None, optional
+            Do not store Q_k beyond this step (the backward transient of the CLV
+            recursion makes late steps useless, so their Q need not be kept).
 
         Returns
         -------
@@ -465,6 +490,7 @@ class DynSys():
             # Initial run
             U = self.flatten(fields)
             le_sum = np.zeros(n)
+            np.random.seed(42)
             if isinstance(b, str):
                 if b == 'U':
                     b = U.copy()
@@ -503,6 +529,16 @@ class DynSys():
             le_sum += np.log(diagR + 1e-300)
 
             t = (step + 1) * T
+
+            # Ginelli forward pass: keep the QR factors of this step (k = step + 1)
+            if store_dir is not None:
+                k = step + 1
+                os.makedirs(store_dir, exist_ok=True)
+                np.save(os.path.join(store_dir, f'R_{k:05d}.npy'), R)
+                if (store_Q_every is not None and k % store_Q_every == 0
+                        and (store_Q_max is None or k <= store_Q_max)):
+                    np.save(os.path.join(store_dir, f'Q_{k:05d}.npy'), Q)
+                    np.save(os.path.join(store_dir, f'U_{k:05d}.npy'), Uevol)
 
             if return_hist:
                 le_hist[step, :] = le_sum / t
@@ -572,6 +608,115 @@ class DynSys():
         le_hist = le_hist[:, sort_idx]
 
         return lyap_exponents, D_KY, le_hist
+
+
+def covariant_lyapunov_vectors(store_dir, k_lo=None, k_hi=None, n_back=None,
+                               load_Q=True, seed=0, verbose=True):
+    ''' Covariant Lyapunov vectors (CLVs) by the backward pass of Ginelli et al.,
+    PRL 99, 130601 (2007), from the QR factors stored by `DynSys.lyapunov_exponents`
+    (`store_dir`). Pure numpy: no solver is needed.
+
+    The forward pass gives J_T Q_{k-1} = Q_k R_k (t_k = k T). Writing the j-th CLV
+    in the Gram-Schmidt basis, v_j(t_k) = Q_k c_k^{(j)}, covariance
+    J_T v_j(t_{k-1}) ∝ v_j(t_k) becomes R_k c_{k-1} ∝ c_k, i.e.
+
+        c_{k-1} = R_k^{-1} c_k / ||R_k^{-1} c_k||        (backward recursion)
+
+    v_j lies in span(Q_k[:, :j]) (backward Oseledets filtration), so the coefficient
+    matrix C_k = [c^{(1)} ... c^{(n)}] is upper triangular and stays so. Starting from
+    an arbitrary upper-triangular C at k_hi and iterating down, C_k converges to the
+    CLV coefficients after a backward transient: only k <= k_hi - n_back is trusted.
+    The log growth of CLV j across step k, g_k^{(j)} = log||R_k c_{k-1}|| =
+    -log||R_k^{-1} c_k||, averaged over the trusted window and divided by T, must
+    reproduce lambda_j; this is the convergence check.
+
+    Parameters
+    ----------
+    store_dir : str
+        Directory holding R_{k:05d}.npy for every k and Q_{k:05d}.npy for some k.
+    k_lo, k_hi : int or None
+        Steps to process: R_k is used for k_lo < k <= k_hi and C_k is returned for
+        k_lo <= k <= k_hi. Default: every R present.
+    n_back : int or None
+        Backward transient in steps; default 40% of (k_hi - k_lo).
+    load_Q : bool
+        Also form V_k = Q_k C_k for every stored Q_k with k_lo <= k <= k_hi - n_back.
+    seed : int
+        Seed of the random upper-triangular start at k_hi.
+
+    Returns
+    -------
+    dict with
+        steps   : (K+1,) ints k_lo .. k_hi
+        C       : (K+1, n, n) unit-column upper-triangular coefficients, C[i] at steps[i]
+        growth  : (K, n) g_k for k = steps[1:], row i <-> step steps[i+1]
+        angles  : (K+1, n, n) angles between CLVs, arccos|c_i . c_j| (Q is orthonormal)
+        k_valid : largest trusted step, k_hi - n_back
+        n_back  : the transient used
+        vectors : {k: (N, n) array} V_k = Q_k C_k for stored, trusted k (if load_Q)
+    '''
+    import re
+    import glob
+    try:
+        from scipy.linalg import solve_triangular
+        _solve = lambda R, C: solve_triangular(R, C)
+    except ImportError:                                   # keep C triangular by hand
+        _solve = lambda R, C: np.triu(np.linalg.solve(R, C))
+
+    ks = {}
+    for f in glob.glob(os.path.join(store_dir, 'R_*.npy')):
+        m = re.search(r'R_(\d+)\.npy$', f)
+        if m:
+            ks[int(m.group(1))] = f
+    if not ks:
+        raise FileNotFoundError(f'no R_*.npy in {store_dir}')
+    if k_hi is None:
+        k_hi = max(ks)
+    if k_lo is None:
+        k_lo = min(ks) - 1
+    missing = [k for k in range(k_lo + 1, k_hi + 1) if k not in ks]
+    if missing:
+        raise FileNotFoundError(f'{store_dir}: missing R for steps {missing[:5]}...')
+
+    K = k_hi - k_lo
+    if n_back is None:
+        n_back = int(round(0.4 * K))
+    n = np.load(ks[k_hi]).shape[0]
+
+    rng = np.random.default_rng(seed)
+    C = np.triu(rng.random((n, n)) + 0.5)                 # positive diagonal: safe start
+    C /= np.linalg.norm(C, axis=0)
+
+    C_hist = np.zeros((K + 1, n, n))
+    growth = np.zeros((K, n))
+    C_hist[K] = C
+    for k in range(k_hi, k_lo, -1):
+        X = _solve(np.load(ks[k]), C)                      # R_k^{-1} C_k
+        norms = np.linalg.norm(X, axis=0)
+        growth[k - k_lo - 1] = -np.log(norms)              # growth across step k
+        C = X / norms
+        C_hist[k - k_lo - 1] = C
+
+    cos = np.abs(np.einsum('kij,kil->kjl', C_hist, C_hist))
+    angles = np.arccos(np.clip(cos, 0.0, 1.0))
+
+    k_valid = k_hi - n_back
+    out = dict(steps=np.arange(k_lo, k_hi + 1), C=C_hist, growth=growth, angles=angles,
+               k_valid=k_valid, n_back=n_back, vectors={})
+    if load_Q:
+        for f in sorted(glob.glob(os.path.join(store_dir, 'Q_*.npy'))):
+            m = re.search(r'Q_(\d+)\.npy$', f)
+            k = int(m.group(1)) if m else None
+            if k is None or k < k_lo or k > k_valid:
+                continue
+            out['vectors'][k] = np.load(f) @ C_hist[k - k_lo]
+    if verbose:
+        lam_clv = growth[:max(k_valid - k_lo, 1)].mean(axis=0)
+        print(f'CLV backward pass: steps {k_lo}..{k_hi}, trusted <= {k_valid}, '
+              f'mean log-growth per step over trusted window: {np.array2string(lam_clv, precision=4)}; '
+              f'{len(out["vectors"])} vector sets formed')
+    return out
+
 
 class UPONewtonSolver(DynSys):
     """
@@ -1092,7 +1237,8 @@ class ArclengthNewtonSolver(UPONewtonSolver):
             print(content, file=open(path, "a"))
 
     def update_lda(self, lda):
-        '''Updates lambda parameter in solver. norm: normalization parameter
+        '''Updates the continuation parameter lambda in the solver.
+        lda is Re for KolmogorovFlow and Ra/norm_val for BOUSS and RayleighBenard2D.
 
         WARNING (JAX backend): mutating a parameter that a jitted ``rkstep``
         reads from ``self`` (e.g. Kolmogorov nu) is NOT picked up by the
@@ -1103,11 +1249,9 @@ class ArclengthNewtonSolver(UPONewtonSolver):
         compiled JVPs are keyed on ``solver.ad_cache_key() = (ra, pr)``.
         '''
         if self.solver.solver == 'KolmogorovFlow':
-            self.solver.pm.nu = 1 / lda  # Assigning directly to solver's pm since self.pm is removed
-        elif self.solver.solver == 'BOUSS':
-            self.solver.pm.ra = lda * self.norm_val
-        elif self.solver.solver == 'RayleighBenard2D':
-            # the next evolve builds (or reuses) the operators for the new ra
+            self.solver.nu = 1 / lda
+        elif self.solver.solver in ('BOUSS', 'RayleighBenard2D'):
+            # RayleighBenard2D: the next evolve builds (or reuses) the operators for the new ra
             self.solver.ra = lda * self.norm_val
         else:
             raise Exception(
@@ -1180,10 +1324,17 @@ class ArclengthNewtonSolver(UPONewtonSolver):
         return apply_A, UT
 
     def run_arclength(self, X0, X1, X_restart=None, iA: int | None = None):
-        """Run Newton iterations for one arclength step from X0 to a new solution near X1."""
+        """Run Newton iterations for one arclength step: starting from the two
+        previous converged solutions X0 and X1, converge to a new solution at
+        arclength distance ~dr further along the branch (Chandler & Kerswell 2013)."""
         dr = np.linalg.norm(X1 - X0)
         dX_dr = (X1 - X0) / dr
-        X = X_restart if X_restart is not None else X1
+
+        if X_restart is not None:
+            X = X_restart
+        else:
+            # Linear extrapolation predictor along the branch: satisfies N(X) = 0
+            X = X1 + dr * self.alpha**2 * dX_dr
 
         start_iN = self.restart_iN + 1 if (iA == self.restart_iA) else 1
         self._Delta_prev = None
@@ -1195,7 +1346,8 @@ class ArclengthNewtonSolver(UPONewtonSolver):
 
             N = self.N_constraint(X, dX_dr, dr, X1)
             b = np.append(b, -N)
-            F = self.norm(b[:-1])
+            # Full residual of the extended system, consistent with F_new from hookstep
+            F = self.norm(b)
 
             self.write_newton(iN, F, U, sx, T, (lda * self.norm_val, N), iA)
             self.write_headers(iN, iA)
@@ -1213,13 +1365,16 @@ class ArclengthNewtonSolver(UPONewtonSolver):
                 b = self.form_b(U, UT)
                 N = self.N_constraint(X, dX_dr, dr, X1)
                 b = np.append(b, -N)
-                F = self.norm(b[:-1])
-                
+                F = self.norm(b)
+
                 self.write_newton(iN + 1, F, U, sx, T, (lda * self.norm_val, N), iA)
 
                 if iA is not None:
                     self.save_converged(X, iA)
                 return X
+
+        # not converged: return None (callers may retry with a smaller dr; run_arc_auto raises)
+        return None
 
     def run_arc_auto(self, X0, X1, X_restart=None):
         """Automate successive arclength continuation steps, using each converged solution as the next predictor."""
@@ -1230,6 +1385,9 @@ class ArclengthNewtonSolver(UPONewtonSolver):
                 self.write_header_newton(iA=iA)
 
             X = self.run_arclength(X0, X1, X_restart, iA)
+            if X is None:
+                raise RuntimeError(
+                    f'Arclength Newton iteration did not converge in {self.N_newt} iterations (iA={iA})')
             X0 = X1
             X1 = X
             X_restart = None
@@ -1237,13 +1395,12 @@ class ArclengthNewtonSolver(UPONewtonSolver):
     def save_converged(self, X, iA):
         """Save converged solution fields and scalar parameters to the converged directory."""
         U, T, sx, lda = self.unpack_X(X)
-        path = self._get_path(self.converged_dir, "solver.txt", iA=iA)
-        if not path:
+        path = self._get_path(self.converged_dir, "solver.txt")
+        if path is None:
             return
-        os.makedirs(os.path.dirname(path), exist_ok=True)
 
-        if iA == 0 and not os.path.exists(path):
+        if not os.path.exists(path):
             print("iA, T, sx, lda, |U|", file=open(path, "a"))
 
         print(f"{iA:02},{T},{sx:.8e},{lda * self.norm_val},{self.norm(U):.6e}", file=open(path, "a"))
-        self.write_fields(U, idx=0, path=os.path.dirname(path))
+        self.write_fields(U, idx=iA, path=os.path.dirname(path))

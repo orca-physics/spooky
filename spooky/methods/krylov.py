@@ -1,5 +1,4 @@
 import numpy as np
-import scipy
 import time
 import os
 
@@ -168,6 +167,7 @@ def arnoldi_eig(A, b, n, tol):
     return eigval, eigvec, Q[:,:k]
 
 def test_gmres():
+    import scipy
     m = 1000
     np.random.seed(0)
 
@@ -208,6 +208,7 @@ def test_gmres():
     print('Scipy convergenge:', info, 'rel. residual:', np.linalg.norm(b - A @ x_scipy)/np.linalg.norm(b))
 
 def test_arnoldi():
+    import matplotlib.pyplot as plt
     m = 1000
     np.random.seed(0)
 
