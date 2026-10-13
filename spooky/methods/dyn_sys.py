@@ -745,6 +745,7 @@ class UPONewtonSolver(DynSys):
                  reduc_reg: float = 0.5,
                  mu_search: bool = False,
                  delta_inc: float = 2.0,
+                 delta_max_rel: float | None = 0.1,
                  sp1: bool = False,
                  sp2: bool = False,
                  sp_dU: bool = False,
@@ -794,6 +795,8 @@ class UPONewtonSolver(DynSys):
         # mu_search: solve the trust-region subproblem for |y| ~ Delta and keep Delta between Newton iterations
         self.mu_search = mu_search
         self.delta_inc = delta_inc
+        # mu_search: the first trial radius is at most delta_max_rel * |U| (None: no cap)
+        self.delta_max_rel = delta_max_rel
         self._Delta_prev = None
         self.tol_newt = tol_newt
         self.tol_improve = tol_improve
@@ -971,7 +974,7 @@ class UPONewtonSolver(DynSys):
         y = backsub(H, beta)
         trust_region = self.trust_region_function(H, beta, iN, y)
 
-        Delta, mu = self.hook_start(y)
+        Delta, mu = self.hook_start(y, U)
         for iH in range(self.N_hook):
             y, mu = trust_region(Delta, mu)
             dx = Q@y
@@ -997,18 +1000,26 @@ class UPONewtonSolver(DynSys):
         self.hook_done(y, iH, F_new <= lin_exp)
         return X_new, F_new, UT
 
-    def hook_start(self, y0):
+    def hook_start(self, y0, U):
         """Initial (Delta, mu) of a hookstep.  mu = 0 means: try the full Newton step y0 first.
-        With ``mu_search``, Delta is capped by the radius kept from the previous Newton iteration."""
+        With ``mu_search``, Delta is capped by the radius kept from the previous Newton iteration and by
+        ``delta_max_rel`` |U|: with an ill-conditioned R, |y0| is dominated by near-null directions and can
+        exceed |U| by orders of magnitude, and halving down from it wastes one evolve per trial."""
         Delta = self.norm(y0)
-        if self.mu_search and self._Delta_prev is not None and self._Delta_prev < Delta:
-            return self._Delta_prev, self.mu0
-        return Delta, 0.
+        if not self.mu_search:
+            return Delta, 0.
+        caps = [Delta]
+        if self._Delta_prev is not None:
+            caps.append(self._Delta_prev)
+        if self.delta_max_rel is not None:
+            caps.append(self.delta_max_rel * self.norm(U))
+        Delta_0 = min(caps)
+        return (Delta_0, self.mu0) if Delta_0 < Delta else (Delta, 0.)
 
     def hook_done(self, y, iH, accepted):
         """With ``mu_search``, keep the accepted |y| as the next radius, enlarged by ``delta_inc`` if the
         first trial was accepted.  If all ``N_hook`` trials were rejected, forget the radius (the next
-        iteration starts again from the full Newton step) instead of keeping the last, shrunken one."""
+        iteration starts again from min(|y0|, delta_max_rel |U|)) instead of keeping the last, shrunken one."""
         if self.mu_search:
             self._Delta_prev = self.norm(y) * (self.delta_inc if iH == 0 else 1.) if accepted else None
 
@@ -1178,7 +1189,7 @@ class ArclengthNewtonSolver(UPONewtonSolver):
         y = backsub(H, beta)
 
         trust_region = self.trust_region_function(H, beta, iN, y, arclength["iA"])
-        Delta, mu = self.hook_start(y)
+        Delta, mu = self.hook_start(y, U)
         UT = None
 
         for iH in range(self.N_hook):
