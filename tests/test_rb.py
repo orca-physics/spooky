@@ -68,6 +68,24 @@ def test_chebyshev_derivative_and_quadrature():
     assert abs(float(grid.average(fld)) - 1.0 / 3.0) < 1e-10
 
 
+@pytest.mark.parametrize('Nx', [48, 50, 64, 96])
+def test_dealiasing_no_alias_onto_kept_modes(Nx):
+    """u = cos(k x) sin(z)^2 at the highest kept mode k: u u_x = -k/2 sin(2kx) sin(z)^4
+    has no content at any kept mode, so the dealiased advection must vanish there
+    (with k <= Nx/3 kept, Nx = 48 and 96 aliased mode Nx/3 onto itself)."""
+    grid = sp.Grid2D_wall(2 * np.pi, np.pi, Nx, 17, 1e-3)
+    solver = RayleighBenard2D(grid, ra=1e6)
+    kept = ~np.asarray(grid.dealias_modes)[:, 0]
+    k = int(np.nonzero(kept)[0].max())
+    assert 3 * k < Nx
+    x = np.linspace(0, 2 * np.pi, Nx, endpoint=False)[:, None]
+    z = np.asarray(grid.zi)[None, :]
+    u = np.cos(k * x) * np.sin(z) ** 2
+    a_u, _, _ = solver._advection(grid.forward(u), grid.forward(np.zeros_like(u)),
+                                  grid.forward(np.zeros_like(u)))
+    assert np.abs(np.asarray(a_u)[kept]).max() < 1e-10 * k * Nx
+
+
 # ---------------------------------------------------------------------------
 # Boundary conditions + incompressibility
 # ---------------------------------------------------------------------------

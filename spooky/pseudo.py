@@ -243,7 +243,9 @@ class Grid2D_wall(Grid1D):
         self.kx_col = self.kx[:, None]                          # (Nkx, 1) broadcast
         self.k2x = self.kx ** 2
         ki = xnp.fft.rfftfreq(Nx, 1 / Nx)
-        self.dealias_modes = (ki > Nx / 3)[:, None]            # x-mode mask, (Nkx,1)
+        # 2/3 rule: keep k < Nx/3, so that p + q of two kept modes never aliases onto a kept mode
+        # (with k <= Nx/3, mode Nx/3 was kept when 3 | Nx, e.g. Nx = 384, 768, and aliased onto itself)
+        self.dealias_modes = (ki >= Nx / 3)[:, None]           # x-mode mask, (Nkx,1)
 
         self.Nx = Nx
         self.Nz = Nz
