@@ -490,7 +490,6 @@ class DynSys():
             # Initial run
             U = self.flatten(fields)
             le_sum = np.zeros(n)
-            np.random.seed(42)
             if isinstance(b, str):
                 if b == 'U':
                     b = U.copy()
