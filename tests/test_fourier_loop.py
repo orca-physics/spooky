@@ -1,8 +1,9 @@
 """Tests for FourierLoop (methods/fourier_loop.py). The residual is checked
 against an analytic band-limited loop (modes |m| <= 2, |kx|, |ky| <= 2, so
-the products stay within N/3), and against a reference computed by an
-independent implementation on a random loop
-(fixtures/fourier_loop_reference.npz).
+the products stay within N/3), against a reference computed on a random
+loop by an earlier implementation of the same design
+(fixtures/fourier_loop_reference.npz), and on an exact traveling wave of a
+pure advection solver (the shift's sign end to end).
 
 Run with:  NUMPY_BACKEND=jax pytest tests/test_fourier_loop.py
 """
@@ -177,8 +178,8 @@ def test_loss(solver):
     loop = make_loop(solver)
     params = loop.make(Series(seed=3)()[:2], 7.7, 0.3)
     R = np.asarray(loop.residual(params))
-    total, diag = loop.loss(params, lambda_phys=2.0)
-    phys = 2.0*np.sum(np.mean(R**2, (1, 2, 3)))
+    total, diag = loop.loss(params)
+    phys = np.sum(np.mean(R**2, (1, 2, 3)))
     np.testing.assert_allclose(float(total), phys, rtol=1e-12)
     np.testing.assert_allclose(float(diag['phys']), phys, rtol=1e-12)
     np.testing.assert_allclose(float(diag['phys_div'] + diag['phys_mom']),
@@ -233,8 +234,9 @@ def test_solenoidal(solver):
 
 
 def test_from_window(tmp_path, solver):
-    """The solver's snapshots at the given steps, resampled; T and s as given;
-    a wrong number of steps is refused"""
+    """The solver's snapshots at the given steps, resampled and the k-th
+    translated by s*k/Nt (the comoving frame); T and s as given; a wrong
+    number of steps is refused"""
     rng = np.random.default_rng(5)
     steps = [0, 10, 20, 30]
     for st in steps:
@@ -247,7 +249,13 @@ def test_from_window(tmp_path, solver):
     U = np.asarray(params['a'])/np.sqrt(loop.w)
     u = resample(np.load(tmp_path/'uu.0030.npy'), N)
     v = resample(np.load(tmp_path/'vv.0030.npy'), N)
-    np.testing.assert_allclose(U[:, 3], np.stack([u, v]), atol=1e-12)
+    # The independent shift: a phase exp(i kx 0.1*3/4) on the full fft2
+    k = np.fft.fftfreq(N, 1/N)[:, None]
+    shifted = [np.fft.ifft2(np.fft.fft2(f)*np.exp(1j*k*0.1*3/4)).real for f in (u, v)]
+    np.testing.assert_allclose(U[:, 3], np.stack(shifted), atol=1e-12)
+    np.testing.assert_allclose(U[:, 0], np.stack([
+        resample(np.load(tmp_path/f'{n}.0000.npy'), N) for n in ('uu', 'vv')]),
+        atol=1e-12)
     with pytest.raises(ValueError):
         loop.from_window(str(tmp_path), steps[:3], 7.4, 0.1)
 
@@ -326,14 +334,16 @@ def test_optimize_converges(tmp_path):
     saved = []
     odir = str(tmp_path/'run')
     out, it, reason = loop.optimize(params, odir, max_iters=5000,
-                                    loss_floor=1e-20, log_every=10,
-                                    save_every=100, verbose=False,
+                                    loss_floor=1e-20, log_every=1,
+                                    plateau_iters=1000, save_every=100,
+                                    verbose=False,
                                     on_save=lambda it, p: saved.append(it))
     assert reason == 'loss floor'
     assert float(loop.loss(out)[0]) < 1e-20
     rows = np.loadtxt(os.path.join(odir, 'fourier.dat'))
-    assert rows[0, 0] == 0 and rows[-1, 0] == it
-    assert rows[-1, 2] < 1e-20 < rows[0, 2]
+    assert rows[0, 0] == 0 and rows[-1, 0] == it and len(rows) == it + 1
+    # It stops at the first iterate below the floor, the one logged
+    assert rows[-1, 2] < 1e-20 <= rows[-2, 2]
     assert open(os.path.join(odir, 'done')).read().split() == [str(it), 'loss', 'floor']
     expect = [0] + list(range(100, it + 1, 100)) + ([it] if it % 100 else [])
     assert saved == expect
@@ -398,3 +408,75 @@ def test_to_fields(solver):
     newt = UPONewtonSolver(big, T, sx)
     X = newt.form_X(newt.flatten(fields), T, sx)
     assert X.shape == (2*48*48 + 2,) and (X[-2], X[-1]) == (7.7, 0.3)
+
+
+class Advection:
+    """A stand-in solver, du/dt = -c du/dx: every field g(x - c t, y) is an
+    exact traveling wave, a relative periodic orbit with any T and sx = c T"""
+    num_fields = 2
+
+    def __init__(self, n, c):
+        import spooky as sp
+        self.grid = sp.Grid2D(2*np.pi, 2*np.pi, n, n, 1e-3)
+        self.c = c
+
+    def rhs(self, fields):
+        return [-self.c*self.grid.deriv(f, self.grid.kx) for f in fields]
+
+    def load_fields(self, path, step):
+        return [np.load(os.path.join(path, f'{n}.{step:04}.npy')) for n in ('uu', 'vv')]
+
+
+def test_traveling_wave(tmp_path):
+    """The shift end to end: a window of a traveling wave, built with s =
+    c T, is an exact loop (from_window takes the snapshots to the comoving
+    frame); with -s it is not; to_fields hands over sx = s, and Newton's
+    equation translate(u(T), sx) = u(0) holds for the lab-frame u(T)"""
+    n, c, T, Nt = 24, 0.37, 2.0, 8
+    x = 2*np.pi*np.arange(n)/n
+    X, Y = np.meshgrid(x, x, indexing='ij')
+    # A divergence-free g from a stream function, u = dpsi/dy, v = -dpsi/dx
+    g = lambda X: [np.cos(X + 2*Y) + 1.5*np.sin(2*X - Y),
+                   -0.5*np.cos(X + 2*Y) + 3*np.sin(2*X - Y)]
+    for k in range(Nt):
+        u = g(X - c*T*k/Nt)
+        np.save(tmp_path/f'uu.{k:04}.npy', u[0])
+        np.save(tmp_path/f'vv.{k:04}.npy', u[1])
+    solver = Advection(n, c)
+    loop = make_loop(solver, Nt=Nt)
+    steps = list(range(Nt))
+    params = loop.from_window(str(tmp_path), steps, T, c*T)
+    assert float(loop.loss(params)[0]) < 1e-26
+    assert float(loop.loss(loop.from_window(str(tmp_path), steps, T, -c*T))[0]) > 0.1
+    fields, T_out, sx = loop.to_fields(params, solver.grid)
+    assert (T_out, sx) == (T, c*T)
+    np.testing.assert_allclose(np.stack(fields), np.stack(g(X)), atol=1e-12)
+    uT = solver.grid.translate(g(X - c*T), sx)
+    np.testing.assert_allclose(np.stack([np.asarray(f) for f in uT]),
+                               np.stack(fields), atol=1e-12)
+
+
+def test_resample_odd_sizes():
+    """Odd sizes keep every mode they can hold, |k| <= (n - 1)/2"""
+    from spooky.methods.fourier_loop import resample
+
+    def field(n, k):
+        x = 2*np.pi*np.arange(n)/n
+        X, Y = np.meshgrid(x, x, indexing='ij')
+        return np.cos(k*X) + np.sin(k*Y)
+    np.testing.assert_allclose(resample(field(32, 10), 21), field(21, 10), atol=1e-12)
+    np.testing.assert_allclose(resample(field(21, 10), 32), field(32, 10), atol=1e-12)
+
+
+def test_argument_checks(tmp_path, solver):
+    """plateau_iters must be a positive multiple of log_every; to_fields
+    needs the loop's domain"""
+    import spooky as sp
+    loop = make_loop(solver)
+    params = loop.make(Series(seed=1)()[:2], 7.7, 0.3)
+    for plateau_iters in (5, 15):
+        with pytest.raises(ValueError):
+            loop.optimize(params, str(tmp_path/'a'), max_iters=1, log_every=10,
+                          plateau_iters=plateau_iters, verbose=False)
+    with pytest.raises(ValueError):
+        loop.to_fields(params, sp.Grid2D(2*np.pi, np.pi, 48, 48, 1e-3))

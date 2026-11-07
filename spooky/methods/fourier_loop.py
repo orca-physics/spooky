@@ -71,6 +71,8 @@ class FourierLoop:
             raise RuntimeError('FourierLoop requires NUMPY_BACKEND=jax')
         if not isinstance(solver.grid, ps.Grid2D):
             raise NotImplementedError('FourierLoop: Grid2D only')
+        if not jax.config.jax_enable_x64:
+            raise RuntimeError('FourierLoop requires float64 (JAX_ENABLE_X64=1)')
         self.solver = solver
         self.grid = solver.grid
         self.Nt = Nt
@@ -155,11 +157,11 @@ class FourierLoop:
         F = self.fields(params)
         return jnp.mean(jnp.sum((F - F.mean(1, keepdims=True))**2, 0))
 
-    def loss(self, params, lambda_phys=1.0):
-        """The sum over the residual's components of the grid mean of
-        lambda_phys*f^2. Returns (total, diagnostics), A logged only."""
+    def loss(self, params):
+        """The sum over the residual's components of the grid mean of f^2.
+        Returns (total, diagnostics), A logged only."""
         R = self.residual(params)
-        per_eq = jnp.mean(lambda_phys*R**2, (1, 2, 3))
+        per_eq = jnp.mean(R**2, (1, 2, 3))
         phys = jnp.sum(per_eq)
         diag = {'phys': phys, 'phys_div': per_eq[0],
                 'phys_mom': jnp.sum(per_eq[1:]), 'A': self.fluct(params)}
@@ -168,12 +170,17 @@ class FourierLoop:
     def from_window(self, path, steps, T, s):
         """The loop of a DNS segment, as P&S build theirs: the solver's
         output at the Nt given steps (one period's worth, evenly spaced),
-        resampled to the grid, closed with whatever jump the window has"""
+        resampled to the grid and taken to the comoving frame (the k-th
+        translated by s*k/Nt, so U(tau_k, x) = u(t_k, x + s*tau_k)), closed
+        with whatever jump the window has"""
         if len(steps) != self.Nt:
             raise ValueError(f'{len(steps)} steps for Nt = {self.Nt}')
-        snaps = [self.solver.load_fields(path, st) for st in steps]
+        snaps = [resample(self.solver.load_fields(path, st), self.grid.shape)
+                 for st in steps]
+        snaps = [[np.asarray(f) for f in self.grid.translate(list(u), s*k/self.Nt)]
+                 for k, u in enumerate(snaps)]
         U = np.array(snaps).transpose(1, 0, 2, 3)
-        return self.make(resample(U, self.grid.shape), T, s)
+        return self.make(U, T, s)
 
     def snapshot(self, params, shape=None):
         """The fields at tau = 0 (comoving and lab frames coincide there),
@@ -185,8 +192,12 @@ class FourierLoop:
         """(fields, T, sx): the fields at tau = 0 on grid (default: the
         loop's), cleaned there as the solver's own (solenoidal projection,
         zero mean, dealiased), as a Newton search starts from them:
-        X = newt.form_X(newt.flatten(fields), T, sx)"""
+        X = newt.form_X(newt.flatten(fields), T, sx). grid must span the
+        loop's domain (Lx, Ly)."""
         grid = grid or self.grid
+        if not np.allclose((grid.Lx, grid.Ly), (self.grid.Lx, self.grid.Ly)):
+            raise ValueError(f'grid domain {(grid.Lx, grid.Ly)}, the loop\'s is '
+                             f'{(self.grid.Lx, self.grid.Ly)}')
         f = [grid.forward(jnp.asarray(u)) for u in self.snapshot(params, grid.shape)]
         f = grid.inc_proj(f)
         f = [index_update(ff, grid.zero_mode, 0.0) for ff in f]
@@ -202,31 +213,33 @@ class FourierLoop:
 
     def load(self, path):
         """params of a saved state, checked against this loop's shape"""
-        z = np.load(path)
-        saved = (int(z['Nt']), int(z['Nx']), int(z['Ny']), bool(z['solenoidal']))
-        mine = (self.Nt, self.grid.Nx, self.grid.Ny, self.solenoidal)
-        if saved != mine:
-            raise ValueError(f'{path}: (Nt, Nx, Ny, solenoidal) {saved}, '
-                             f'the loop is {mine}')
-        return {'a': jnp.asarray(z['a'], jnp.float64),
-                'T': jnp.asarray(z['T'][()], jnp.float64),
-                's': jnp.asarray(z['s'][()], jnp.float64)}
+        with np.load(path) as z:
+            saved = (int(z['Nt']), int(z['Nx']), int(z['Ny']), bool(z['solenoidal']))
+            mine = (self.Nt, self.grid.Nx, self.grid.Ny, self.solenoidal)
+            if saved != mine:
+                raise ValueError(f'{path}: (Nt, Nx, Ny, solenoidal) {saved}, '
+                                 f'the loop is {mine}')
+            return {'a': jnp.asarray(z['a'], jnp.float64),
+                    'T': jnp.asarray(z['T'][()], jnp.float64),
+                    's': jnp.asarray(z['s'][()], jnp.float64)}
 
     def optimize(self, params, odir, max_iters, wall_hours=None,
                  memory_size=10, stall_iters=20, loss_floor=1e-16,
                  plateau_iters=20000, plateau_drop=0.01, log_every=1000,
-                 save_every=50000, lambda_phys=1.0, on_save=None,
-                 verbose=True):
+                 save_every=50000, on_save=None, verbose=True):
         """L-BFGS (optax) on the loss over the flat vector of params (the L2
         metric on the fields, weight 1 on T and s). T and s are not clipped:
         clipping after an update would corrupt the L-BFGS memory.
 
         Stops at max_iters, after wall_hours, after stall_iters consecutive
-        zero steps (a failed line search), when T <= 0 or the loss is not
-        finite, when the loss is below loss_floor (roundoff), or at a
-        plateau: at a log row, the loss fell by less than the fraction
-        plateau_drop since the row plateau_iters earlier (a multiple of
-        log_every). Returns (params, it, reason).
+        zero steps (optax's zoom line search takes a zero step only when the
+        loss is not finite along the direction and no safe step was found;
+        an ordinary failed search takes a nonzero step), when T <= 0 or the
+        loss is not finite, when the loss is below loss_floor (roundoff), or
+        at a plateau: at a log row, the loss fell by less than the fraction
+        plateau_drop since the row plateau_iters earlier (a positive
+        multiple of log_every). The stops test the loss at the new iterate,
+        the one logged. Returns (params, it, reason).
 
         Writes in odir (a run with saved states is refused: restart from
         one with load() into a new odir):
@@ -245,6 +258,9 @@ class FourierLoop:
         import optax
         from jax.flatten_util import ravel_pytree
 
+        if plateau_iters < log_every or plateau_iters % log_every:
+            raise ValueError(f'plateau_iters {plateau_iters} must be a positive '
+                             f'multiple of log_every {log_every}')
         t0 = time.time()
         states = os.path.join(odir, 'states')
         if os.path.isdir(states) and os.listdir(states):
@@ -258,7 +274,7 @@ class FourierLoop:
         marks = ravel_pytree({'a': jnp.zeros_like(params['a']),
                               'T': jnp.asarray(1.0), 's': jnp.asarray(2.0)})[0]
         iT, i_s = int(jnp.argmax(marks == 1.0)), int(jnp.argmax(marks == 2.0))
-        terms = lambda y: self.loss(unravel(y), lambda_phys)
+        terms = lambda y: self.loss(unravel(y))
         loss = lambda y: terms(y)[0]
 
         @jax.jit
@@ -276,22 +292,27 @@ class FourierLoop:
             updates, state = opt.update(grad, state, y, value=value, grad=grad,
                                         value_fn=loss)
             info = optax.tree_utils.tree_get(state, 'info')
+            # value above is the loss at y (cached by the last line search);
+            # the state now holds the loss at the new iterate
             ls = dict(step=optax.tree_utils.tree_norm(updates),
                       lr=optax.tree_utils.tree_get(state, 'learning_rate'),
                       ls_steps=info.num_linesearch_steps,
                       decrease_err=info.decrease_error,
-                      curvature_err=info.curvature_error, value=value)
+                      curvature_err=info.curvature_error,
+                      value=optax.tree_utils.tree_get(state, 'value'))
             return optax.apply_updates(y, updates), state, ls
 
-        fh = open(os.path.join(odir, 'fourier.dat'), 'w')
-        print('# ' + ' '.join(LOG_COLS), file=fh, flush=True)
+        log = os.path.join(odir, 'fourier.dat')
+        with open(log, 'w') as f:
+            print('# ' + ' '.join(LOG_COLS), file=f)
 
         def row(it, y, ls=None):
             vals = {k: float(v) for k, v in diagnostics(y).items()}
             vals.update(it=it, wall=time.time() - t0, T=float(y[iT]), s=float(y[i_s]))
             vals.update({k: float(v) for k, v in (ls or {}).items()})
-            print(' '.join(f'{vals.get(c, np.nan):.10g}' for c in LOG_COLS),
-                  file=fh, flush=True)
+            with open(log, 'a') as f:
+                print(' '.join(f'{vals.get(c, np.nan):.10g}' for c in LOG_COLS),
+                      file=f)
             if verbose:
                 print(f'it {it} loss {vals["loss"]:.4e} div {vals["phys_div"]:.3e} '
                       f'mom {vals["phys_mom"]:.3e} A {vals["A"]:.4g} '
@@ -309,8 +330,7 @@ class FourierLoop:
 
         with open(os.path.join(odir, 'info.txt'), 'w') as f:
             print(f'Nt {self.Nt} grid {self.grid.shape} solenoidal {self.solenoidal} '
-                  f'unknowns {y.size} memory_size {memory_size} '
-                  f'lambda_phys {lambda_phys}', file=f)
+                  f'unknowns {y.size} memory_size {memory_size}', file=f)
             print(f'jax {jax.__version__} {jax.devices()} optax {optax.__version__}',
                   file=f)
         row(0, y)
@@ -353,7 +373,6 @@ class FourierLoop:
             row(it, y, ls)
         if it % save_every:
             save(it, y)
-        fh.close()
         with open(os.path.join(odir, 'done'), 'w') as f:
             print(it, reason, file=f)
         return unravel(y), it, reason
@@ -362,12 +381,13 @@ class FourierLoop:
 def resample(F, shape):
     """Fields on a periodic grid (..., Mx, My) on shape = (Nx, Ny) points
     (or N for N x N), by truncating or zero-padding the spectrum (the
-    Nyquist modes dropped); exact for fields with |ki| < min(Mi, Ni)/2"""
+    Nyquist modes of even sizes dropped); exact for fields with
+    |ki| < min(Mi, Ni)/2"""
     F = np.asarray(F)
     Nx, Ny = (shape, shape) if np.isscalar(shape) else shape
     Mx, My = F.shape[-2:]
     Fh = np.fft.fft2(F, axes=(-2, -1))
-    nx, ny = min(Mx, Nx)//2, min(My, Ny)//2
+    nx, ny = (min(Mx, Nx) + 1)//2, (min(My, Ny) + 1)//2
     ix, iy = np.r_[0:nx, -nx+1:0], np.r_[0:ny, -ny+1:0]
     out = np.zeros(F.shape[:-2] + (Nx, Ny), complex)
     out[..., ix[:, None], iy[None, :]] = Fh[..., ix[:, None], iy[None, :]]
