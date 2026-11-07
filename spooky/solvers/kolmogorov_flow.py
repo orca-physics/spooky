@@ -62,11 +62,11 @@ class KolmogorovFlow(PseudoSpectral):
         self.fy = xnp.zeros_like(self.fx, dtype=complex)
         self.fx, self.fy = self.grid.inc_proj([self.fx, self.fy])
 
-    @apply_jit
-    def rkstep(self, fields, prev, oo, dt):
+    def rhs(self, fields):
+        ''' Time derivative of the Fourier fields [fu, fv], the pressure
+        included (projected non-linear term) '''
         # Unpack
         fu, fv = fields
-        fup, fvp = prev
 
         # Non-linear term
         uu = self.grid.inverse(fu)
@@ -83,17 +83,24 @@ class KolmogorovFlow(PseudoSpectral):
         gx, gy = self.grid.inc_proj([gx, gy])
 
         # Equations
-        fu = fup + (dt/oo) * (
-            - gx
-            - self.nu * self.grid.k2 * fu 
-            + self.fx
-            )
+        du = (- gx
+              - self.nu * self.grid.k2 * fu
+              + self.fx)
 
-        fv = fvp + (dt/oo) * (
-            - gy
-            - self.nu * self.grid.k2 * fv 
-            + self.fy
-            )
+        dv = (- gy
+              - self.nu * self.grid.k2 * fv
+              + self.fy)
+
+        return [du, dv]
+
+    @apply_jit
+    def rkstep(self, fields, prev, oo, dt):
+        # Unpack
+        fup, fvp = prev
+        du, dv = self.rhs(fields)
+
+        fu = fup + (dt/oo) * du
+        fv = fvp + (dt/oo) * dv
 
         # de-aliasing
         fu = index_update(fu, self.grid.zero_mode, 0.0)

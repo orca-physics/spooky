@@ -52,11 +52,11 @@ class NSE3D(PseudoSpectral):
         self.fy = (f0/amp) * self.fy
         self.fz = (f0/amp) * self.fz
 
-    @apply_jit
-    def rkstep(self, fields, prev, oo, dt):
+    def rhs(self, fields):
+        ''' Time derivative of the Fourier fields [fu, fv, fw], the pressure
+        included (projected non-linear term) '''
         # Unpack
         fu, fv, fw = fields
-        fup, fvp, fwp = prev
 
         # Non-linear term
         uu = self.grid.inverse(fu)
@@ -81,23 +81,29 @@ class NSE3D(PseudoSpectral):
         gx, gy, gz = self.grid.inc_proj([gx, gy, gz])
 
         # Equations
-        fu = fup + (dt/oo) * (
-            - gx
-            - self.nu * self.grid.k2 * fu 
-            + self.fx
-            )
+        du = (- gx
+              - self.nu * self.grid.k2 * fu
+              + self.fx)
 
-        fv = fvp + (dt/oo) * (
-            - gy
-            - self.nu * self.grid.k2 * fv 
-            + self.fy
-            )
+        dv = (- gy
+              - self.nu * self.grid.k2 * fv
+              + self.fy)
 
-        fw = fwp + (dt/oo) * (
-            - gz
-            - self.nu * self.grid.k2 * fw 
-            + self.fz
-            )
+        dw = (- gz
+              - self.nu * self.grid.k2 * fw
+              + self.fz)
+
+        return [du, dv, dw]
+
+    @apply_jit
+    def rkstep(self, fields, prev, oo, dt):
+        # Unpack
+        fup, fvp, fwp = prev
+        du, dv, dw = self.rhs(fields)
+
+        fu = fup + (dt/oo) * du
+        fv = fvp + (dt/oo) * dv
+        fw = fwp + (dt/oo) * dw
 
         # de-aliasing
         fu = index_update(fu, self.grid.zero_mode, 0.0)
