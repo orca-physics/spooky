@@ -4,14 +4,20 @@ over one period, its residual minimized directly.
 Reference: Parker & Schneider, J. Fluid Mech. 2022 (the PV method, here with
 the pressure eliminated exactly).
 """
+import os
+
 import numpy as np
 
 from .. import pseudo as ps
-from .._backend import JAX_ENABLED
+from .._backend import JAX_ENABLED, index_update
 
 if JAX_ENABLED:
     import jax
     import jax.numpy as jnp
+
+LOG_COLS = ['it', 'wall', 'loss', 'phys', 'phys_div', 'phys_mom', 'A', 'T', 's',
+            'grad_fields', 'grad_Ts', 'step', 'lr', 'ls_steps', 'decrease_err',
+            'curvature_err']
 
 
 class FourierLoop:
@@ -38,7 +44,8 @@ class FourierLoop:
     Only the dealiased modes reach the fields; the other directions of a
     have zero gradient. Arrays are (field, tau, x, y).
 
-    Requires the JAX backend, in float64 (JAX_ENABLE_X64=1).
+    Requires the JAX backend, in float64 (JAX_ENABLE_X64=1); optimize also
+    needs optax.
 
     Parameters
     ----------
@@ -54,7 +61,9 @@ class FourierLoop:
     -------
     >>> loop = FourierLoop(solver, Nt=32)
     >>> params = loop.from_window('output', steps, T=7.4, s=0.0)
-    >>> total, diag = loop.loss(params)
+    >>> params, it, reason = loop.optimize(params, 'odir_loop', max_iters=10**6)
+    >>> fields, T, sx = loop.to_fields(params, newt.grid)
+    >>> newt.run_newton(newt.form_X(newt.flatten(fields), T, sx))
     """
 
     def __init__(self, solver, Nt, solenoidal=False):
@@ -171,6 +180,183 @@ class FourierLoop:
         resampled to shape (default: the grid's)"""
         U0 = np.asarray(self.fields(params)[:, 0])
         return resample(U0, shape or self.grid.shape)
+
+    def to_fields(self, params, grid=None):
+        """(fields, T, sx): the fields at tau = 0 on grid (default: the
+        loop's), cleaned there as the solver's own (solenoidal projection,
+        zero mean, dealiased), as a Newton search starts from them:
+        X = newt.form_X(newt.flatten(fields), T, sx)"""
+        grid = grid or self.grid
+        f = [grid.forward(jnp.asarray(u)) for u in self.snapshot(params, grid.shape)]
+        f = grid.inc_proj(f)
+        f = [index_update(ff, grid.zero_mode, 0.0) for ff in f]
+        f = [index_update(ff, grid.dealias_modes, 0.0) for ff in f]
+        fields = [np.asarray(grid.inverse(ff)) for ff in f]
+        return fields, float(params['T']), float(params['s'])
+
+    def save(self, path, params):
+        """A state (.npz): a, T, s and the loop's shape"""
+        np.savez(path, a=np.asarray(params['a']), T=float(params['T']),
+                 s=float(params['s']), Nt=self.Nt, Nx=self.grid.Nx,
+                 Ny=self.grid.Ny, solenoidal=self.solenoidal)
+
+    def load(self, path):
+        """params of a saved state, checked against this loop's shape"""
+        z = np.load(path)
+        saved = (int(z['Nt']), int(z['Nx']), int(z['Ny']), bool(z['solenoidal']))
+        mine = (self.Nt, self.grid.Nx, self.grid.Ny, self.solenoidal)
+        if saved != mine:
+            raise ValueError(f'{path}: (Nt, Nx, Ny, solenoidal) {saved}, '
+                             f'the loop is {mine}')
+        return {'a': jnp.asarray(z['a'], jnp.float64),
+                'T': jnp.asarray(z['T'][()], jnp.float64),
+                's': jnp.asarray(z['s'][()], jnp.float64)}
+
+    def optimize(self, params, odir, max_iters, wall_hours=None,
+                 memory_size=10, stall_iters=20, loss_floor=1e-16,
+                 plateau_iters=20000, plateau_drop=0.01, log_every=1000,
+                 save_every=50000, lambda_phys=1.0, on_save=None,
+                 verbose=True):
+        """L-BFGS (optax) on the loss over the flat vector of params (the L2
+        metric on the fields, weight 1 on T and s). T and s are not clipped:
+        clipping after an update would corrupt the L-BFGS memory.
+
+        Stops at max_iters, after wall_hours, after stall_iters consecutive
+        zero steps (a failed line search), when T <= 0 or the loss is not
+        finite, when the loss is below loss_floor (roundoff), or at a
+        plateau: at a log row, the loss fell by less than the fraction
+        plateau_drop since the row plateau_iters earlier (a multiple of
+        log_every). Returns (params, it, reason).
+
+        Writes in odir (a run with saved states is refused: restart from
+        one with load() into a new odir):
+            fourier.dat  a row every log_every iterations (columns in its
+                         header): the loss and its terms, A, T, s, the
+                         gradient's norm on the fields and on (T, s), and
+                         the last step's norm, line search step size,
+                         steps, decrease and curvature errors
+            states/loop-IIIIIII.npz  every save_every iterations and at
+                         the end (save(); 0 is the start)
+            inverse.dat  it, T, s at each saved state
+            info.txt, done (iterations and the reason)
+        on_save(it, params), if given, runs at each saved state.
+        """
+        import time
+        import optax
+        from jax.flatten_util import ravel_pytree
+
+        t0 = time.time()
+        states = os.path.join(odir, 'states')
+        if os.path.isdir(states) and os.listdir(states):
+            raise ValueError(f'{states} is not empty: a new run needs a new odir')
+        os.makedirs(states, exist_ok=True)
+        for f in ('fourier.dat', 'inverse.dat', 'done'):
+            if os.path.exists(os.path.join(odir, f)):
+                os.remove(os.path.join(odir, f))
+
+        y, unravel = ravel_pytree(params)
+        marks = ravel_pytree({'a': jnp.zeros_like(params['a']),
+                              'T': jnp.asarray(1.0), 's': jnp.asarray(2.0)})[0]
+        iT, i_s = int(jnp.argmax(marks == 1.0)), int(jnp.argmax(marks == 2.0))
+        terms = lambda y: self.loss(unravel(y), lambda_phys)
+        loss = lambda y: terms(y)[0]
+
+        @jax.jit
+        def diagnostics(y):
+            (total, diag), g = jax.value_and_grad(terms, has_aux=True)(y)
+            gTs = jnp.sqrt(g[iT]**2 + g[i_s]**2)
+            gF = jnp.sqrt(jnp.maximum(jnp.sum(g**2) - gTs**2, 0.0))
+            return dict(diag, loss=total, grad_fields=gF, grad_Ts=gTs)
+
+        opt = optax.lbfgs(memory_size=memory_size)
+
+        @jax.jit
+        def step(y, state):
+            value, grad = optax.value_and_grad_from_state(loss)(y, state=state)
+            updates, state = opt.update(grad, state, y, value=value, grad=grad,
+                                        value_fn=loss)
+            info = optax.tree_utils.tree_get(state, 'info')
+            ls = dict(step=optax.tree_utils.tree_norm(updates),
+                      lr=optax.tree_utils.tree_get(state, 'learning_rate'),
+                      ls_steps=info.num_linesearch_steps,
+                      decrease_err=info.decrease_error,
+                      curvature_err=info.curvature_error, value=value)
+            return optax.apply_updates(y, updates), state, ls
+
+        fh = open(os.path.join(odir, 'fourier.dat'), 'w')
+        print('# ' + ' '.join(LOG_COLS), file=fh, flush=True)
+
+        def row(it, y, ls=None):
+            vals = {k: float(v) for k, v in diagnostics(y).items()}
+            vals.update(it=it, wall=time.time() - t0, T=float(y[iT]), s=float(y[i_s]))
+            vals.update({k: float(v) for k, v in (ls or {}).items()})
+            print(' '.join(f'{vals.get(c, np.nan):.10g}' for c in LOG_COLS),
+                  file=fh, flush=True)
+            if verbose:
+                print(f'it {it} loss {vals["loss"]:.4e} div {vals["phys_div"]:.3e} '
+                      f'mom {vals["phys_mom"]:.3e} A {vals["A"]:.4g} '
+                      f'T {vals["T"]:.6f} s {vals["s"]:+.6f} '
+                      f'|g| {vals["grad_fields"]:.3e} {vals["grad_Ts"]:.3e} '
+                      f'wall {vals["wall"]:.1f} s', flush=True)
+
+        def save(it, y):
+            p = unravel(y)
+            self.save(os.path.join(states, f'loop-{it:07d}.npz'), p)
+            with open(os.path.join(odir, 'inverse.dat'), 'a') as f:
+                print(it, float(p['T']), float(p['s']), file=f)
+            if on_save is not None:
+                on_save(it, p)
+
+        with open(os.path.join(odir, 'info.txt'), 'w') as f:
+            print(f'Nt {self.Nt} grid {self.grid.shape} solenoidal {self.solenoidal} '
+                  f'unknowns {y.size} memory_size {memory_size} '
+                  f'lambda_phys {lambda_phys}', file=f)
+            print(f'jax {jax.__version__} {jax.devices()} optax {optax.__version__}',
+                  file=f)
+        row(0, y)
+        save(0, y)
+
+        state = opt.init(y)
+        it, stalled, reason, ls = 0, 0, 'max_iters', None
+        lag = plateau_iters//log_every
+        hist = []                    # the loss at each log row
+        while it < max_iters:
+            if wall_hours is not None and time.time() - t0 > 3600*wall_hours:
+                reason = 'wall time'
+                break
+            it += 1
+            y, state, ls = step(y, state)
+            stalled = stalled + 1 if float(ls['step']) == 0.0 else 0
+            value = float(ls.pop('value'))
+            plateau = False
+            if it % log_every == 0:
+                row(it, y, ls)
+                hist.append(value)
+                plateau = (len(hist) > lag
+                           and value > (1.0 - plateau_drop)*hist[-1 - lag])
+            if it % save_every == 0:
+                save(it, y)
+            if stalled >= stall_iters:
+                reason = f'{stalled} zero steps'
+            elif not np.isfinite(value):
+                reason = 'loss not finite'
+            elif float(y[iT]) <= 0.0:
+                reason = 'T <= 0'
+            elif value < loss_floor:
+                reason = 'loss floor'
+            elif plateau:
+                reason = 'plateau'
+            else:
+                continue
+            break
+        if it % log_every:
+            row(it, y, ls)
+        if it % save_every:
+            save(it, y)
+        fh.close()
+        with open(os.path.join(odir, 'done'), 'w') as f:
+            print(it, reason, file=f)
+        return unravel(y), it, reason
 
 
 def resample(F, shape):

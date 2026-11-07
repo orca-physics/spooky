@@ -297,3 +297,104 @@ def test_tau_nyquist_dropped(solver):
     U = np.zeros((2, Nt, N, N))
     U[0] = ((-1.0)**np.arange(Nt))[:, None, None]*np.cos(x)[None, :, None]
     assert np.abs(np.asarray(loop.fields(loop.make(U, 7.7, 0.3)))).max() < 1e-13
+
+
+def test_shift_convention(solver):
+    """s is UPONewtonSolver's sx: for a pattern frozen in the comoving frame,
+    u(T, x) = U(1, x - s) = U(0, x - s), and translate(u(T), s) = u(0)"""
+    x = 2*np.pi*np.arange(N)/N
+    X, Y = np.meshgrid(x, x, indexing='ij')
+    g = lambda X: np.cos(3*X + Y) + 0.5*np.sin(X - 2*Y)
+    s = 0.7
+    uT = solver.grid.translate([g(X - s)], s)[0]
+    np.testing.assert_allclose(np.asarray(uT), g(X), atol=1e-12)
+
+
+def laminar_start(solver, Nt, eps=1e-2, seed=0):
+    Nx = solver.grid.Nx
+    y = 2*np.pi*np.arange(Nx)/Nx
+    U = eps*np.random.default_rng(seed).standard_normal((2, Nt, Nx, Nx))
+    U[0] += np.sin(4*y)/(16*nu)
+    return U
+
+
+def test_optimize_converges(tmp_path):
+    """From near the laminar state, L-BFGS reaches the loss floor; the
+    outputs, the saved states and on_save"""
+    loop = make_loop(make_solver(16), Nt=4)
+    params = loop.make(laminar_start(loop.solver, 4), 5.0, 0.1)
+    saved = []
+    odir = str(tmp_path/'run')
+    out, it, reason = loop.optimize(params, odir, max_iters=5000,
+                                    loss_floor=1e-20, log_every=10,
+                                    save_every=100, verbose=False,
+                                    on_save=lambda it, p: saved.append(it))
+    assert reason == 'loss floor'
+    assert float(loop.loss(out)[0]) < 1e-20
+    rows = np.loadtxt(os.path.join(odir, 'fourier.dat'))
+    assert rows[0, 0] == 0 and rows[-1, 0] == it
+    assert rows[-1, 2] < 1e-20 < rows[0, 2]
+    assert open(os.path.join(odir, 'done')).read().split() == [str(it), 'loss', 'floor']
+    expect = [0] + list(range(100, it + 1, 100)) + ([it] if it % 100 else [])
+    assert saved == expect
+    inv = np.loadtxt(os.path.join(odir, 'inverse.dat'), ndmin=2)
+    assert list(inv[:, 0].astype(int)) == expect
+    last = loop.load(os.path.join(odir, 'states', f'loop-{it:07d}.npz'))
+    for k in ('a', 'T', 's'):
+        np.testing.assert_array_equal(np.asarray(last[k]), np.asarray(out[k]))
+    # A run with saved states is refused; a loop of another shape can't load
+    with pytest.raises(ValueError):
+        loop.optimize(params, odir, max_iters=1, verbose=False)
+    with pytest.raises(ValueError):
+        make_loop(make_solver(16), Nt=8).load(
+            os.path.join(odir, 'states', 'loop-0000000.npz'))
+
+
+def test_optimize_stops(tmp_path):
+    """max_iters and the plateau"""
+    loop = make_loop(make_solver(16), Nt=4)
+    params = loop.make(laminar_start(loop.solver, 4, eps=0.3), 5.0, 0.1)
+    _, it, reason = loop.optimize(params, str(tmp_path/'a'), max_iters=3,
+                                  log_every=1, verbose=False)
+    assert (it, reason) == (3, 'max_iters')
+    assert len(np.loadtxt(str(tmp_path/'a'/'fourier.dat'))) == 4
+    # plateau_drop 1: any loss counts as no progress, so it stops at the
+    # first row with one plateau_iters behind it
+    _, it, reason = loop.optimize(params, str(tmp_path/'b'), max_iters=1000,
+                                  log_every=5, plateau_iters=10,
+                                  plateau_drop=1.0, verbose=False)
+    assert (it, reason) == (15, 'plateau')
+
+
+def test_to_fields(solver):
+    """The tau = 0 fields resampled to another grid and cleaned there; T,
+    and sx = s"""
+    from spooky.methods import UPONewtonSolver
+    U = Series(seed=9)()[:2]
+    U[0] += 0.5                      # a mean, removed by fields()
+    loop = make_loop(solver)
+    params = loop.make(U, 7.7, 0.3)
+    big = make_solver(48)
+    fields, T, sx = loop.to_fields(params, big.grid)
+    assert (T, sx) == (7.7, 0.3)
+    assert [f.shape for f in fields] == [(48, 48)]*2
+    # The free loop's tau = 0 slice, projected on the big grid
+    k = np.fft.fftfreq(48, 1/48)
+    KX, KY = np.meshgrid(k, k, indexing='ij')
+    up = loop.snapshot(params, (48, 48))
+    G = np.fft.fft2(up)
+    assert np.abs(np.fft.ifft2(KX*G[0] + KY*G[1])).max() > 0.1
+    F = [np.fft.fft2(f) for f in fields]
+    assert np.abs(np.fft.ifft2(KX*F[0] + KY*F[1])).max() < 1e-12
+    for f in fields:
+        assert abs(f.mean()) < 1e-14
+    K2 = np.where(KX**2 + KY**2 > 0, KX**2 + KY**2, 1.0)
+    kG = (KX*G[0] + KY*G[1])/K2
+    proj = [np.fft.ifft2(G[0] - KX*kG).real, np.fft.ifft2(G[1] - KY*kG).real]
+    np.testing.assert_allclose(np.stack(fields), np.stack(proj), atol=1e-12)
+    # Default grid: the loop's own; and X for Newton
+    own, _, _ = loop.to_fields(params)
+    assert own[0].shape == (N, N)
+    newt = UPONewtonSolver(big, T, sx)
+    X = newt.form_X(newt.flatten(fields), T, sx)
+    assert X.shape == (2*48*48 + 2,) and (X[-2], X[-1]) == (7.7, 0.3)
