@@ -35,6 +35,9 @@ class NSE3D(PseudoSpectral):
         self.solver = 'NSE3D'
         self.ext = ext
 
+        # viscosity
+        self.nu = nu
+
         # Generate rng key
         self.key = get_key(seed)        
 
