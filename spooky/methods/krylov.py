@@ -1,5 +1,4 @@
 import numpy as np
-import matplotlib.pyplot as plt
 import scipy
 import time
 import os
@@ -227,7 +226,8 @@ def test_arnoldi():
     print('Arnoldi iterations:', len(eigval_H))    
 
     eigval_A, eigvec_A = np.linalg.eig(A)
-        
+
+    import matplotlib.pyplot as plt
     plt.figure()
     plt.scatter(eigval_A.real, eigval_A.imag, lw = 0, marker = 'o', s = 16)
     plt.scatter(eigval_H.real, eigval_H.imag, lw = 0, marker = 'o', s = 8)

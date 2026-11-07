@@ -10,6 +10,7 @@ if BACKEND == 'jax':
         print("Using JAX backend.")
         JAX_ENABLED = True
     except ImportError:
+        import numpy as xnp
         print("JAX requested but not installed. Falling back to NumPy.")
         JAX_ENABLED = False
 elif BACKEND == 'numpy':
@@ -22,6 +23,12 @@ else:
 def _jax_index_update(arr, indices, values=0.0):
     """JAX-specific update (immutable, array.at)."""
     # The 'arr' is guaranteed to be a JAX array here
+    # A full-shape boolean mask (e.g. dealias_modes) lowers to a scatter over
+    # every True entry, which XLA runs ~1000x slower than a select on GPU.
+    if (getattr(indices, 'dtype', None) == bool
+            and getattr(indices, 'shape', None) == arr.shape
+            and xnp.ndim(values) == 0):
+        return xnp.where(indices, values, arr)
     return arr.at[indices].set(values)
 
 def _numpy_index_update(arr, indices, values=0.0):
@@ -35,8 +42,12 @@ def _numpy_index_update(arr, indices, values=0.0):
 if JAX_ENABLED:
     index_update = _jax_index_update
 
-    from jax import jit, grad
+    from jax import jit, grad, vmap, jvp, vjp, jacfwd, jacrev
+    from jax import lax as jax_lax
     from functools import partial
+
+    lax_scan = jax_lax.scan
+
     def apply_jit(func):
         return partial(jit, static_argnums=(0,))(func)
 
@@ -54,6 +65,21 @@ else:
 
     def copy_arr(arr):
         return xnp.copy(arr)
+
+    def _ad_stub(name):
+        def stub(*args, **kwargs):
+            raise NotImplementedError(
+                f"{name} requires JAX backend (set NUMPY_BACKEND=jax)."
+            )
+        stub.__name__ = name
+        return stub
+
+    vmap     = _ad_stub("vmap")
+    jvp      = _ad_stub("jvp")
+    vjp      = _ad_stub("vjp")
+    jacfwd   = _ad_stub("jacfwd")
+    jacrev   = _ad_stub("jacrev")
+    lax_scan = _ad_stub("lax_scan")
 
 # --- 3. Random Numbers (Stateless Pattern) ---
 if JAX_ENABLED:

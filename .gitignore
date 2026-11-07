@@ -26,3 +26,8 @@ venv/
 
 # Example outputs
 examples/*/outs/
+
+# Generated example outputs
+examples/**/balance.dat
+examples/**/*.png
+examples/**/output/

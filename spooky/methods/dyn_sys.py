@@ -2,8 +2,10 @@ from .krylov import GMRES, backsub, arnoldi_eig
 import os
 import numpy as np
 import functools
+from collections import OrderedDict
 
 from .. import pseudo as ps
+from .._backend import JAX_ENABLED
 
 class DynSys():
     """General class for Dynamical Systems-based methods.
@@ -23,7 +25,11 @@ class DynSys():
         self.solver = solver
         self.grid = solver.grid
 
-        self.remove_boundary = False
+        # Wall-bounded grids carry interior-only state for the UPO/Floquet
+        # machinery: the Dirichlet boundary rows are stripped on flatten and
+        # re-padded with zeros on unflatten. Grids advertise this via a
+        # ``remove_boundary`` attribute (e.g. Grid2D_semi).
+        self.remove_boundary = getattr(self.grid, 'remove_boundary', False)
         if isinstance(self.grid, ps.Grid2D_semi):
             self.remove_boundary = True
 
@@ -80,6 +86,171 @@ class DynSys():
         ''' Writes fields to binary file'''
         fields = self.unflatten(U)
         return self.solver.write_fields(fields, idx, path)
+
+    # --- AD methods (require JAX backend) ------------------------------------
+
+    def ad_evolve(self, fields, T):
+        """AD-compatible evolution on field lists. Requires JAX backend."""
+        return self.solver.ad_evolve(fields, T)
+
+    def jvp_evolve(self, fields, tangent_fields, T):
+        """Forward-mode AD: exact tangent map J·v on field lists.
+
+        Parameters
+        ----------
+        fields : list of arrays
+            Base point (physical space).
+        tangent_fields : list of arrays
+            Tangent vector v (same structure as fields).
+        T : float
+            Integration time.
+
+        Returns
+        -------
+        primals : list of arrays
+            Evolved fields Φ(fields, T).
+        tangents : list of arrays
+            Tangent output J·v where J = dΦ/d(fields).
+
+        The JVP is jitted once per ``(T, solver.ad_cache_key())`` and cached
+        (``jvp_cache_size`` entries), so repeated calls at the same T -- every
+        GMRES or Arnoldi iteration -- reuse one compilation instead of
+        retracing the whole time loop.
+        """
+        return self._compiled_jvp(T)(fields, tangent_fields)
+
+    #: number of compiled JVPs kept by jvp_evolve
+    jvp_cache_size = 4
+
+    def _compiled_jvp(self, T, batched=False):
+        ''' jit((fields, tangents) -> jvp of solver.ad_evolve over T), cached.
+        ``batched``: the tangents carry a leading batch axis and the JVP is
+        vmapped over it with the base trajectory left unbatched, so it is
+        computed once and returned without a batch axis.  The key includes
+        ``solver.ad_cache_key()`` (the solver parameters its traced evolution
+        reads), so a parameter change gives a new entry instead of a stale
+        compiled map. '''
+        from .._backend import jit, jvp, vmap
+        key = (bool(batched), float(T)) + tuple(self.solver.ad_cache_key())
+        cache = self.__dict__.setdefault('_jvp_cache', OrderedDict())
+        if key not in cache:
+            solver, T_ = self.solver, key[1]
+            F = lambda u: solver.ad_evolve(u, T_)
+            if batched:
+                fn = lambda f, dfs: vmap(lambda df: jvp(F, (f,), (df,)), out_axes=(None, 0))(dfs)
+            else:
+                fn = lambda f, df: jvp(F, (f,), (df,))
+            cache[key] = jit(fn)
+            while len(cache) > self.jvp_cache_size:
+                cache.popitem(last=False)
+        cache.move_to_end(key)
+        return cache[key]
+
+    def vjp_evolve(self, fields, cotangent_fields, T):
+        """Reverse-mode AD: adjoint action J^T·v on field lists.
+
+        Parameters
+        ----------
+        fields : list of arrays
+            Base point (physical space).
+        cotangent_fields : list of arrays
+            Cotangent vector v (same structure as output fields).
+        T : float
+            Integration time.
+
+        Returns
+        -------
+        primals : list of arrays
+            Evolved fields Φ(fields, T).
+        cotangents : list of arrays
+            Adjoint output J^T·v where J = dΦ/d(fields).
+        """
+        from .._backend import vjp
+        primals, vjp_fn = vjp(
+            lambda f: self.solver.ad_evolve(f, T),
+            fields
+        )
+        return primals, vjp_fn(cotangent_fields)
+
+    def tangent_map(self, U, dU, T, sx=None, UT=None, ep0=1e-7):
+        """Action of the tangent map J = d(translate_sx ∘ Φ_T)/dU on dU.
+
+        Flat-vector interface shared by Floquet, Lyapunov and Newton-Krylov.
+        JAX backend: exact JVP through ad_evolve.  NumPy backend: first-order
+        finite difference with step ep0*|U|/|dU|, which requires ``UT``.
+
+        Parameters
+        ----------
+        U, dU : np.ndarray
+            Flat base point and perturbation.
+        T : float
+            Integration time.
+        sx : float or None
+            Optional x-translation applied after the flow map.
+        UT : np.ndarray or None
+            Base-point image translate(Φ_T(U), sx) — required for the FD
+            (NumPy) path, ignored under JAX.
+        ep0 : float
+            FD perturbation scale factor.
+        """
+        if JAX_ENABLED:
+            import jax.numpy as jnp
+            f_jax  = [jnp.array(f) for f in self.unflatten(U)]
+            dU_jax = [jnp.array(d) for d in self.unflatten(dU)]
+            _, tangent_list = self.jvp_evolve(f_jax, dU_jax, T)
+            J_dU = np.array(self.flatten(tangent_list))
+            if sx is not None:
+                J_dU = self.translate(J_dU, sx)
+        else:
+            if UT is None:
+                raise ValueError(
+                    "tangent_map FD path requires UT = translate(Phi_T(U), sx)")
+            epsilon = ep0 * np.linalg.norm(U) / np.linalg.norm(dU)
+            J_dU = self.evolve(U + epsilon * dU, T)
+            if sx is not None:
+                J_dU = self.translate(J_dU, sx)
+            J_dU = (J_dU - UT) / epsilon
+        return J_dU
+
+    def tangent_map_batch(self, U, dUs, T, sx=None, ep0=1e-7):
+        """Batched tangent map: (Uevol, V) with V[:, i] = J · dUs[:, i].
+
+        JAX backend: one jitted forward pass of the JVP vmapped over the n
+        tangents (base trajectory computed once, tangents propagated together
+        as batched products), compiled once per (T, solver.ad_cache_key()) and
+        cached with ``jvp_evolve``.  Memory: O(n x state) -- no linearization
+        tape.  NumPy backend: FD loop over the columns.
+
+        Returns
+        -------
+        Uevol : np.ndarray
+            Untranslated image Φ_T(U) (the next base point).
+        V : np.ndarray, shape (len(U), n)
+            Tangent images (translated by sx if given).
+        """
+        n = dUs.shape[1]
+        V = np.zeros((len(U), n))
+        if JAX_ENABLED:
+            import jax.numpy as jnp
+            f_jax = [jnp.array(f) for f in self.unflatten(U)]
+            cols = [self.unflatten(dUs[:, i]) for i in range(n)]
+            batched = [jnp.stack([np.asarray(c[j]) for c in cols])
+                       for j in range(self.solver.num_fields)]
+            primals, tans = self._compiled_jvp(T, batched=True)(f_jax, batched)
+            Uevol = np.array(self.flatten(primals))
+            for i in range(n):
+                V[:, i] = self.flatten([np.array(t[i]) for t in tans])
+                if sx is not None:
+                    V[:, i] = self.translate(V[:, i], sx)
+        else:
+            Uevol = self.evolve(U, T)
+            UT = self.translate(Uevol, sx) if sx is not None else Uevol
+            for i in range(n):
+                V[:, i] = self.tangent_map(U, dUs[:, i], T, sx=sx, UT=UT,
+                                           ep0=ep0)
+        return Uevol, V
+
+    # -------------------------------------------------------------------------
 
     def phase_shifted_b(self, fields):
         """Generate b vector by modifying phases in Fourier space."""
@@ -151,20 +322,7 @@ class DynSys():
 
         def apply_J(dU):
             ''' Applies J (jacobian of poincare map) matrix to vector dU  '''
-            # 1e-7 factor chosen to balance accuracy and numerical stability
-            epsilon = ep0*np.linalg.norm(U)/np.linalg.norm(dU)
-
-            # Perturb U by epsilon*dU
-            U_pert = U + epsilon*dU
-
-            # Calculate derivative w.r.t. initial fields
-            dUT_dU = self.evolve(U_pert, T)
-
-            if sx is not None:
-                dUT_dU = self.translate(dUT_dU, sx)
-
-            dUT_dU = (dUT_dU - UT)/epsilon
-            return dUT_dU
+            return self.tangent_map(U, dU, T, sx=sx, UT=UT, ep0=ep0)
 
         if isinstance(b, str):
             if b == 'U':
@@ -303,26 +461,15 @@ class DynSys():
             if return_hist:
                 le_hist = np.zeros((nsteps, n))
 
-        def apply_J(U, dU, Uevol):
-            "Applies the finite-time tangent map DΦ_T(U) to perturbation dU using finite differences."
-            epsilon = ep0 * np.linalg.norm(U) / np.linalg.norm(dU)
-            U_pert = U + epsilon * dU
-            dUT_dU = self.evolve(U_pert, T) - Uevol
-            if sx is not None:
-                dUT_dU = self.translate(dUT_dU, sx)
-            return dUT_dU / epsilon
-
         # --------------------------------------------------
         # --- MAIN LOOP ------------------------------------
         # --------------------------------------------------
 
         for step in range(start_step, nsteps):
 
-            V = np.zeros_like(Q)
-            Uevol = self.evolve(U, T)
-
-            for i in range(n):
-                V[:, i] = apply_J(U, Q[:, i], Uevol)
+            # batched tangent map: exact linearized pass under JAX,
+            # FD column loop under NumPy (see tangent_map_batch)
+            Uevol, V = self.tangent_map_batch(U, Q, T, sx=sx, ep0=ep0)
 
             Q, R = np.linalg.qr(V)
 
@@ -416,8 +563,6 @@ class UPONewtonSolver(DynSys):
                  tol_newt: float = 1e-5,
                  tol_gmres: float = 1e-3,
                  tol_improve: float = 1e-3,
-                 tol_nudge: float = 1e-3,
-                 frac_nudge: float = 0.,
                  restart_iN: int = 0,
                  eps0: float = 1e-7,
                  mu0: float = 1e-3,
@@ -468,8 +613,6 @@ class UPONewtonSolver(DynSys):
         self.reduc_reg = reduc_reg
         self.mu0 = mu0
         self.mu_inc = mu_inc
-        self.tol_nudge = tol_nudge
-        self.frac_nudge = frac_nudge
         self.tol_newt = tol_newt
         self.tol_improve = tol_improve
         
@@ -579,13 +722,13 @@ class UPONewtonSolver(DynSys):
         def apply_A(dX):
             ''' Applies A (extended Jacobian) to vector X^t  '''
             dU, dT, ds = self.unpack_X(dX)
-            epsilon = self.eps0*self.norm(U)/self.norm(dU)
-            U_pert = self.apply_proj(U, epsilon*dU, self.sp1)
 
-            dUT_dU = self.evolve(U_pert, T)
-            if self.sx is not None:
-                dUT_dU = self.translate(dUT_dU, sx)
-            dUT_dU = (dUT_dU - UT)/epsilon
+            # sp1 projects the perturbation *direction* (same semantics in
+            # both backends; the NumPy path previously could project U + dU)
+            dU_in = self.sol_project(dU) if self.sp1 else dU
+            dUT_dU = self.tangent_map(U, dU_in, T,
+                                      sx=sx if self.sx is not None else None,
+                                      UT=UT, ep0=self.eps0)
 
             Tx_proj = np.dot(dU_ds.conj(), dU).real
             t_proj = np.dot(dU_dt.conj(), dU).real
@@ -619,9 +762,6 @@ class UPONewtonSolver(DynSys):
             H, beta, Q = GMRES(apply_A, b, self.N_gmres, self.tol_gmres, self.gmres_dir, iN)
             X, F_new, UT = self.hookstep(X, H, beta, Q, iN)
             U, T, sx = self.unpack_X(X)
-
-            if ((F-F_new)/F) < self.tol_nudge:
-                U = self.evolve(U, T*self.frac_nudge)
 
             if (F_new < self.tol_newt) and ((F-F_new)/F < self.tol_improve):
                 save_out = True if self.save_outputs in ('all', 'last') else False
@@ -857,7 +997,13 @@ class ArclengthNewtonSolver(UPONewtonSolver):
             print(content, file=open(path, "a"))
 
     def update_lda(self, lda):
-        '''Updates lambda parameter in solver. norm: normalization parameter'''
+        '''Updates lambda parameter in solver. norm: normalization parameter
+
+        WARNING (JAX backend): mutating a parameter that a jitted ``rkstep``
+        reads from ``self`` (e.g. Kolmogorov nu) is NOT picked up by the
+        cached compiled step -- jit treats self as a static argument.  Under
+        JAX, rebuild the solver instead of mutating it.
+        '''
         if self.solver.solver == 'KolmogorovFlow':
             self.solver.pm.nu = 1 / lda  # Assigning directly to solver's pm since self.pm is removed
         elif self.solver.solver == 'BOUSS':
@@ -903,14 +1049,15 @@ class ArclengthNewtonSolver(UPONewtonSolver):
         self.update_lda(lda)
 
         def apply_A(dX):
+            ''' Applies A (extended Jacobian) to vector X^t  '''
             dU, dT, ds, dlda_val = self.unpack_X(dX)
-            epsilon = 1e-7 * self.norm(U) / self.norm(dU)
-            U_pert = self.apply_proj(U, epsilon * dU, self.sp1)
 
-            dUT_dU = self.evolve(U_pert, T)
-            if self.sx is not None:
-                dUT_dU = self.translate(dUT_dU, sx)
-            dUT_dU = (dUT_dU - UT) / epsilon
+            # sp1 projects the perturbation *direction* (same semantics in
+            # both backends; the NumPy path previously could project U + dU)
+            dU_in = self.sol_project(dU) if self.sp1 else dU
+            dUT_dU = self.tangent_map(U, dU_in, T,
+                                      sx=sx if self.sx is not None else None,
+                                      UT=UT, ep0=self.eps0)
 
             Tx_proj = np.dot(dU_ds.conj(), dU).real
             t_proj = np.dot(dU_dt.conj(), dU).real
@@ -989,6 +1136,8 @@ class ArclengthNewtonSolver(UPONewtonSolver):
         """Save converged solution fields and scalar parameters to the converged directory."""
         U, T, sx, lda = self.unpack_X(X)
         path = self._get_path(self.converged_dir, "solver.txt", iA=iA)
+        if not path:
+            return
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
         if iA == 0 and not os.path.exists(path):

@@ -29,8 +29,6 @@ remove_boundary: false
 N_newt: 50          # Max Newton iterations
 tol_newt: 1.0e-10     # Convergence tolerance
 tol_improve: 1.0e-3   # Relative improvement threshold
-tol_nudge: 1.0e-3     # Nudge threshold
-frac_nudge: 0.0     # Fraction of period for orbit nudge
 restart_iN: 0       # Restart iteration index
 
 # ============================================================

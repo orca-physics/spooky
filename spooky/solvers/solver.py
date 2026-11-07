@@ -31,6 +31,15 @@ class Solver(abc.ABC):
     def evolve(self, fields, T, bstep=None, ostep=None, sstep=None, bpath = '', opath = '', spath = ''):
         return []
 
+    def ad_cache_key(self):
+        ''' Hashable tuple of the parameters that ``ad_evolve`` reads from the
+        solver at trace time.  DynSys keys its compiled JVPs on it, so
+        changing one of them (e.g. Ra in arclength continuation) compiles a
+        new map instead of reusing a stale one.  Default: none -- solvers
+        whose jitted step treats ``self`` as static already freeze their
+        parameters at the first compile (see ``apply_jit``). '''
+        return ()
+
     def balance(self, fields, step, bpath):
         pass
 
