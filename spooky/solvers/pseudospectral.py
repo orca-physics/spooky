@@ -12,6 +12,10 @@ class PseudoSpectral(Solver, abc.ABC):
         - balance: Energy balance
         - spectra: Energy spectra
         - outs: Outputs
+
+    Solvers may also implement rhs (the time derivative of the Fourier
+    fields, which rkstep integrates), needed by methods that evaluate the
+    equations without time stepping.
     '''
     def __init__(self,
                  grid: ps.Grid1D | ps.Grid2D | ps.Grid2D_semi | ps.Grid3D,
@@ -125,6 +129,10 @@ class PseudoSpectral(Solver, abc.ABC):
         if abs(dt_last) > 1e-8:
             fields = rk(fields, dt_last)
         return [self.grid.inverse(ff) for ff in fields]
+
+    def rhs(self, fields):
+        ''' Time derivative of the Fourier fields '''
+        raise NotImplementedError(f'{type(self).__name__} has no rhs')
 
     @abc.abstractmethod
     def rkstep(self, fields, prev, oo, dt):

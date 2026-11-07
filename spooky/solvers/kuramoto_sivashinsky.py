@@ -32,21 +32,28 @@ class KuramotoSivashinsky(PseudoSpectral):
         self.nu = nu
         self.ext = ext
 
-    @apply_jit
-    def rkstep(self, fields, prev, oo, dt):
+    def rhs(self, fields):
+        ''' Time derivative of the Fourier field [fu] '''
         # Unpack
         fu  = fields[0]
-        fup = prev[0]
 
         # Non-linear term
         uu  = self.grid.inverse(fu)
         fu2 = self.grid.forward(uu**2)
 
-        fu = fup + (dt/oo) * (
-            - (0.5*1.0j*self.grid.kx*fu2)
-            + ((self.grid.k2)*fu)
-            - (self.nu*(self.grid.k2**2)*fu)
-            )
+        du = (- (0.5*1.0j*self.grid.kx*fu2)
+              + ((self.grid.k2)*fu)
+              - (self.nu*(self.grid.k2**2)*fu))
+
+        return [du]
+
+    @apply_jit
+    def rkstep(self, fields, prev, oo, dt):
+        # Unpack
+        fup = prev[0]
+        du, = self.rhs(fields)
+
+        fu = fup + (dt/oo) * du
 
         # de-aliasing
         fu = index_update(fu, self.grid.zero_mode, 0.0)

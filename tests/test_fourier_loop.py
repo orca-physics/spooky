@@ -1,0 +1,482 @@
+"""Tests for FourierLoop (methods/fourier_loop.py). The residual is checked
+against an analytic band-limited loop (modes |m| <= 2, |kx|, |ky| <= 2, so
+the products stay within N/3), against a reference computed on a random
+loop by an earlier implementation of the same design
+(fixtures/fourier_loop_reference.npz), and on an exact traveling wave of a
+pure advection solver (the shift's sign end to end).
+
+Run with:  NUMPY_BACKEND=jax pytest tests/test_fourier_loop.py
+"""
+import os
+import pytest
+import numpy as np
+
+pytestmark = pytest.mark.skipif(
+    os.environ.get('NUMPY_BACKEND', 'numpy').lower() != 'jax',
+    reason="FourierLoop tests require NUMPY_BACKEND=jax",
+)
+
+nu = 1.0/40
+Nt, N = 8, 24
+FIXTURES = os.path.join(os.path.dirname(__file__), 'fixtures')
+
+
+def make_solver(n, nu=nu):
+    import spooky as sp
+    from spooky.solvers import KolmogorovFlow
+    grid = sp.Grid2D(2*np.pi, 2*np.pi, n, n, 1e-3)
+    return KolmogorovFlow(grid, kf=4, f0=1.0, nu=nu)
+
+
+@pytest.fixture(scope='module')
+def solver():
+    return make_solver(N)
+
+
+def make_loop(solver, Nt=Nt, solenoidal=False):
+    from spooky.methods import FourierLoop
+    return FourierLoop(solver, Nt, solenoidal=solenoidal)
+
+
+class Series:
+    """(u, v, p) as sums of Re(C exp(i ph)), ph = 2*pi*m*tau + kx*x + ky*y in
+    the comoving coordinates, with exact derivatives"""
+    def __init__(self, seed=0, p_seed=None):
+        self.modes = np.array([(m, kx, ky) for m in range(3)
+                               for kx in range(-2, 3) for ky in range(-2, 3)
+                               if (kx, ky) != (0, 0)], float)
+        rng = np.random.default_rng(seed)
+        A, B = 0.3*rng.standard_normal((2, 3, len(self.modes)))
+        if p_seed is not None:
+            A[2], B[2] = 0.3*np.random.default_rng(p_seed).standard_normal(
+                (2, len(self.modes)))
+        self.C = A - 1j*B
+        tau = np.arange(Nt)/Nt
+        x = 2*np.pi*np.arange(N)/N
+        TT, XX, YY = np.meshgrid(tau, x, x, indexing='ij')
+        m, kx, ky = self.modes.T
+        self.E = np.exp(1j*(2*np.pi*m*TT[..., None] + kx*XX[..., None]
+                            + ky*YY[..., None]))
+
+    def __call__(self, dtau=0, dx=0, dy=0):
+        """(3, Nt, N, N) values of d^(dtau, dx, dy) of (u, v, p)"""
+        m, kx, ky = self.modes.T
+        f = (2j*np.pi*m)**dtau*(1j*kx)**dx*(1j*ky)**dy
+        return np.einsum('cj,...j->c...', self.C*f, self.E).real
+
+    def residual(self, T, s):
+        """The momentum residual with p, (2, Nt, N, N), and continuity"""
+        U, Ut = self(), self(dtau=1)
+        Ux, Uy = self(dx=1), self(dy=1)
+        lap = self(dx=2) + self(dy=2)
+        Dt = (Ut - s*Ux)/T
+        adv = U[0]*Ux + U[1]*Uy
+        y = 2*np.pi*np.arange(N)/N
+        f = np.zeros((2, 1, N, N))
+        f[0] = np.sin(4*y)
+        R = Dt[:2] + adv[:2] - nu*lap[:2] - f + np.stack([Ux[2], Uy[2]])
+        return R, Ux[0] + Uy[1]
+
+
+def leray(F):
+    """F (2, ..., N, N) without its component along k, k != 0 (numpy, full
+    fft2, independent of Grid2D.inc_proj)"""
+    k = np.fft.fftfreq(N, 1.0/N)
+    KX, KY = np.meshgrid(k, k, indexing='ij')
+    K2 = np.where(KX**2 + KY**2 > 0, KX**2 + KY**2, 1.0)
+    G1, G2 = np.fft.fft2(F[0]), np.fft.fft2(F[1])
+    kG = (KX*G1 + KY*G2)/K2
+    return np.stack([np.fft.ifft2(G1 - KX*kG).real,
+                     np.fft.ifft2(G2 - KY*kG).real])
+
+
+def test_residual_matches_analytic(solver):
+    """Continuity exact, momentum the analytic one projected, whatever p"""
+    loop = make_loop(solver)
+    for p_seed in (None, 10):
+        S = Series(p_seed=p_seed)
+        params = loop.make(S()[:2], 7.7, 0.3)
+        R = np.asarray(loop.residual(params))
+        R_ref, div = S.residual(7.7, 0.3)
+        scale = np.abs(R_ref).max()
+        assert scale > 1.0
+        np.testing.assert_allclose(R[0], div, atol=1e-12*scale)
+        np.testing.assert_allclose(R[1:], leray(R_ref), atol=1e-12*scale)
+    # Two p give different residuals and the same reduced one
+    diff = S.residual(7.7, 0.3)[0] - Series().residual(7.7, 0.3)[0]
+    assert np.abs(diff).max() > 0.1
+
+
+def test_reduced_is_min_over_p(solver):
+    """The reduced loss is the one with any p minus the momentum residual's
+    longitudinal part, which grad p can cancel"""
+    S = Series(seed=6)
+    R_ref, div = S.residual(7.7, 0.3)
+    loop = make_loop(solver)
+    R = np.asarray(loop.residual(loop.make(S()[:2], 7.7, 0.3)))
+    full = np.mean(div**2) + np.sum(np.mean(R_ref**2, (1, 2, 3)))
+    reduced = np.sum(np.mean(R**2, (1, 2, 3)))
+    long = np.sum(np.mean((R_ref - leray(R_ref))**2, (1, 2, 3)))
+    assert long > 1.0
+    np.testing.assert_allclose(full - reduced, long, rtol=1e-10)
+
+
+def test_matches_reference():
+    """The reference's residual, loss terms and fields on a random loop (not
+    solenoidal, nonzero means, modes above N/3 and at the tau Nyquist),
+    free and solenoidal"""
+    ref = np.load(os.path.join(FIXTURES, 'fourier_loop_reference.npz'))
+    U = ref['U']
+    solver = make_solver(U.shape[-1], nu=float(ref['nu']))
+    for pre, solenoidal in [('', False), ('sol_', True)]:
+        loop = make_loop(solver, U.shape[1], solenoidal)
+        params = loop.make(U, float(ref['T']), float(ref['s']))
+        for got, key in [(loop.fields(params), 'fields'),
+                         (loop.residual(params), 'residual')]:
+            want = ref[pre + key]
+            np.testing.assert_allclose(np.asarray(got), want,
+                                       atol=1e-12*np.abs(want).max())
+        _, diag = loop.loss(params)
+        for key in ('phys', 'phys_mom'):
+            np.testing.assert_allclose(float(diag[key]), float(ref[pre + key]),
+                                       rtol=1e-12)
+        np.testing.assert_allclose(float(diag['phys_div']),
+                                   float(ref[pre + 'phys_div']),
+                                   rtol=1e-12, atol=1e-25)
+        np.testing.assert_allclose(float(diag['A']), float(ref[pre + 'A']),
+                                   rtol=1e-12)
+
+
+def test_fields_and_fluct(solver):
+    loop = make_loop(solver)
+    Y = Series(seed=1)()[:2]
+    params = loop.make(Y, 7.7, 0.3)
+    # Band-limited, zero spatial mean: fields() returns it unchanged
+    np.testing.assert_allclose(np.asarray(loop.fields(params)), Y, atol=1e-12)
+    A = np.mean(np.sum((Y - Y.mean(1, keepdims=True))**2, 0))
+    np.testing.assert_allclose(float(loop.fluct(params)), A, rtol=1e-12)
+    # A mean flow and modes above N/3 are removed
+    U = Y.copy()
+    U[0] += 0.5
+    U[1] += np.cos(10*2*np.pi*np.arange(N)/N)[None, :, None]
+    np.testing.assert_allclose(np.asarray(loop.fields(loop.make(U, 7.7, 0.3))),
+                               Y, atol=1e-12)
+
+
+def test_metric_is_l2(solver):
+    """|a|^2 is the integral of u^2 + v^2 over (2*pi)^3"""
+    loop = make_loop(solver)
+    params = loop.make(Series(seed=2)()[:2], 7.7, 0.3)
+    U = np.asarray(loop.fields(params))
+    integral = (2*np.pi)**3*np.mean(np.sum(U**2, 0))
+    np.testing.assert_allclose(float(np.sum(np.asarray(params['a'])**2)),
+                               integral, rtol=1e-12)
+
+
+def test_loss(solver):
+    import jax
+    loop = make_loop(solver)
+    params = loop.make(Series(seed=3)()[:2], 7.7, 0.3)
+    R = np.asarray(loop.residual(params))
+    total, diag = loop.loss(params)
+    phys = np.sum(np.mean(R**2, (1, 2, 3)))
+    np.testing.assert_allclose(float(total), phys, rtol=1e-12)
+    np.testing.assert_allclose(float(diag['phys']), phys, rtol=1e-12)
+    np.testing.assert_allclose(float(diag['phys_div'] + diag['phys_mom']),
+                               phys, rtol=1e-12)
+    np.testing.assert_allclose(float(diag['A']), float(loop.fluct(params)),
+                               rtol=1e-12)
+    g = jax.grad(lambda p: loop.loss(p)[0])(params)
+    assert np.all(np.isfinite(np.asarray(g['a'])))
+    assert np.isfinite(float(g['T'])) and np.isfinite(float(g['s']))
+
+
+def test_resample(solver):
+    from spooky.methods.fourier_loop import resample
+    loop = make_loop(solver)
+    F = np.asarray(loop.fields(loop.make(Series(seed=4)()[:2], 7.7, 0.3)))
+    up = resample(F, 64)
+    np.testing.assert_allclose(resample(up, N), F, atol=1e-12)
+    # The export's path: one snapshot, padded to 64
+    params = loop.make(F, 7.7, 0.3)
+    np.testing.assert_allclose(loop.snapshot(params, (64, 64)), up[:, 0],
+                               atol=1e-12)
+
+
+def test_resample_against_analytic():
+    """Up and down against the field evaluated on each grid, square and not"""
+    from spooky.methods.fourier_loop import resample
+
+    def field(nx, ny):
+        x = 2*np.pi*np.arange(nx)/nx
+        y = 2*np.pi*np.arange(ny)/ny
+        X, Y = np.meshgrid(x, y, indexing='ij')
+        return np.cos(3*X + 2*Y) + np.sin(5*Y) - 0.4*np.cos(X - 7*Y)
+    np.testing.assert_allclose(resample(field(N, N), 64), field(64, 64), atol=1e-12)
+    np.testing.assert_allclose(resample(field(64, 64), N), field(N, N), atol=1e-12)
+    np.testing.assert_allclose(resample(field(N, 32), (48, 20)), field(48, 20),
+                               atol=1e-12)
+
+
+def test_solenoidal(solver):
+    """solenoidal: the fields are the Leray projection of the free ones, f0
+    vanishes, and the momentum residual is that of the projected fields"""
+    U = Series(seed=7)()[:2]
+    free, sol = make_loop(solver), make_loop(solver, solenoidal=True)
+    Uf = np.asarray(free.fields(free.make(U, 7.7, 0.3)))
+    Us = np.asarray(sol.fields(sol.make(U, 7.7, 0.3)))
+    np.testing.assert_allclose(leray(Uf), Us, atol=1e-12)
+    assert np.abs(Uf - Us).max() > 0.1
+    R = np.asarray(sol.residual(sol.make(U, 7.7, 0.3)))
+    assert np.abs(R[0]).max() < 1e-12
+    R_free = np.asarray(free.residual(free.make(Us, 7.7, 0.3)))
+    np.testing.assert_allclose(R, R_free, atol=1e-12*np.abs(R).max())
+
+
+def test_from_window(tmp_path, solver):
+    """The solver's snapshots at the given steps, resampled and the k-th
+    translated by s*k/Nt (the comoving frame); T and s as given; a wrong
+    number of steps is refused"""
+    rng = np.random.default_rng(5)
+    steps = [0, 10, 20, 30]
+    for st in steps:
+        for name in ('uu', 'vv'):
+            np.save(tmp_path/f'{name}.{st:04}.npy', rng.standard_normal((32, 32)))
+    loop = make_loop(solver, Nt=4)
+    params = loop.from_window(str(tmp_path), steps, 7.4, 0.1)
+    assert float(params['T']) == 7.4 and float(params['s']) == 0.1
+    from spooky.methods.fourier_loop import resample
+    U = np.asarray(params['a'])/np.sqrt(loop.w)
+    u = resample(np.load(tmp_path/'uu.0030.npy'), N)
+    v = resample(np.load(tmp_path/'vv.0030.npy'), N)
+    # The independent shift: a phase exp(i kx 0.1*3/4) on the full fft2
+    k = np.fft.fftfreq(N, 1/N)[:, None]
+    shifted = [np.fft.ifft2(np.fft.fft2(f)*np.exp(1j*k*0.1*3/4)).real for f in (u, v)]
+    np.testing.assert_allclose(U[:, 3], np.stack(shifted), atol=1e-12)
+    np.testing.assert_allclose(U[:, 0], np.stack([
+        resample(np.load(tmp_path/f'{n}.0000.npy'), N) for n in ('uu', 'vv')]),
+        atol=1e-12)
+    with pytest.raises(ValueError):
+        loop.from_window(str(tmp_path), steps[:3], 7.4, 0.1)
+
+
+def test_laminar_is_exact(solver):
+    """The laminar state u = sin(4y)/(16 nu), v = 0 (steady, any s) has zero
+    residual"""
+    loop = make_loop(solver)
+    y = 2*np.pi*np.arange(N)/N
+    U = np.zeros((2, Nt, N, N))
+    U[0] = np.sin(4*y)/(16*nu)
+    for s in (0.0, 0.3):
+        R = np.asarray(loop.residual(loop.make(U, 7.7, s)))
+        assert np.abs(R).max() < 1e-12
+
+
+def test_gradient_finite_differences(solver):
+    """jax.grad of the loss against central differences, for T, s and a few
+    grid values"""
+    import jax
+    loop = make_loop(solver)
+    params = loop.make(Series(seed=8)()[:2], 7.7, 0.3)
+    f = lambda p: loop.loss(p)[0]
+    g = jax.grad(f)(params)
+    h = 1e-6
+
+    def bump(key, idx=()):
+        def b(e):
+            p = dict(params)
+            p[key] = params[key].at[idx].add(e)
+            return p
+        return b
+    checks = [(bump('T'), g['T']), (bump('s'), g['s'])]
+    for idx in [(0, 1, 2, 3), (1, 5, 10, 7), (0, 7, 23, 0)]:
+        checks.append((bump('a', idx), g['a'][idx]))
+    for b, gj in checks:
+        fd = (float(f(b(h))) - float(f(b(-h))))/(2*h)
+        # atol: the differences' roundoff, ~1e-16*f/h
+        np.testing.assert_allclose(float(gj), fd, rtol=1e-6,
+                                   atol=1e-8*float(f(params)))
+
+
+def test_tau_nyquist_dropped(solver):
+    """The tau Nyquist mode (even Nt) does not reach the fields"""
+    loop = make_loop(solver)
+    x = 2*np.pi*np.arange(N)/N
+    U = np.zeros((2, Nt, N, N))
+    U[0] = ((-1.0)**np.arange(Nt))[:, None, None]*np.cos(x)[None, :, None]
+    assert np.abs(np.asarray(loop.fields(loop.make(U, 7.7, 0.3)))).max() < 1e-13
+
+
+def test_shift_convention(solver):
+    """s is UPONewtonSolver's sx: for a pattern frozen in the comoving frame,
+    u(T, x) = U(1, x - s) = U(0, x - s), and translate(u(T), s) = u(0)"""
+    x = 2*np.pi*np.arange(N)/N
+    X, Y = np.meshgrid(x, x, indexing='ij')
+    g = lambda X: np.cos(3*X + Y) + 0.5*np.sin(X - 2*Y)
+    s = 0.7
+    uT = solver.grid.translate([g(X - s)], s)[0]
+    np.testing.assert_allclose(np.asarray(uT), g(X), atol=1e-12)
+
+
+def laminar_start(solver, Nt, eps=1e-2, seed=0):
+    Nx = solver.grid.Nx
+    y = 2*np.pi*np.arange(Nx)/Nx
+    U = eps*np.random.default_rng(seed).standard_normal((2, Nt, Nx, Nx))
+    U[0] += np.sin(4*y)/(16*nu)
+    return U
+
+
+def test_optimize_converges(tmp_path):
+    """From near the laminar state, L-BFGS reaches the loss floor; the
+    outputs, the saved states and on_save"""
+    loop = make_loop(make_solver(16), Nt=4)
+    params = loop.make(laminar_start(loop.solver, 4), 5.0, 0.1)
+    saved = []
+    odir = str(tmp_path/'run')
+    out, it, reason = loop.optimize(params, odir, max_iters=5000,
+                                    loss_floor=1e-20, log_every=1,
+                                    plateau_iters=1000, save_every=100,
+                                    verbose=False,
+                                    on_save=lambda it, p: saved.append(it))
+    assert reason == 'loss floor'
+    assert float(loop.loss(out)[0]) < 1e-20
+    rows = np.loadtxt(os.path.join(odir, 'fourier.dat'))
+    assert rows[0, 0] == 0 and rows[-1, 0] == it and len(rows) == it + 1
+    # It stops at the first iterate below the floor, the one logged
+    assert rows[-1, 2] < 1e-20 <= rows[-2, 2]
+    assert open(os.path.join(odir, 'done')).read().split() == [str(it), 'loss', 'floor']
+    expect = [0] + list(range(100, it + 1, 100)) + ([it] if it % 100 else [])
+    assert saved == expect
+    inv = np.loadtxt(os.path.join(odir, 'inverse.dat'), ndmin=2)
+    assert list(inv[:, 0].astype(int)) == expect
+    last = loop.load(os.path.join(odir, 'states', f'loop-{it:07d}.npz'))
+    for k in ('a', 'T', 's'):
+        np.testing.assert_array_equal(np.asarray(last[k]), np.asarray(out[k]))
+    # A run with saved states is refused; a loop of another shape can't load
+    with pytest.raises(ValueError):
+        loop.optimize(params, odir, max_iters=1, verbose=False)
+    with pytest.raises(ValueError):
+        make_loop(make_solver(16), Nt=8).load(
+            os.path.join(odir, 'states', 'loop-0000000.npz'))
+
+
+def test_optimize_stops(tmp_path):
+    """max_iters and the plateau"""
+    loop = make_loop(make_solver(16), Nt=4)
+    params = loop.make(laminar_start(loop.solver, 4, eps=0.3), 5.0, 0.1)
+    _, it, reason = loop.optimize(params, str(tmp_path/'a'), max_iters=3,
+                                  log_every=1, verbose=False)
+    assert (it, reason) == (3, 'max_iters')
+    assert len(np.loadtxt(str(tmp_path/'a'/'fourier.dat'))) == 4
+    # plateau_drop 1: any loss counts as no progress, so it stops at the
+    # first row with one plateau_iters behind it
+    _, it, reason = loop.optimize(params, str(tmp_path/'b'), max_iters=1000,
+                                  log_every=5, plateau_iters=10,
+                                  plateau_drop=1.0, verbose=False)
+    assert (it, reason) == (15, 'plateau')
+
+
+def test_to_fields(solver):
+    """The tau = 0 fields resampled to another grid and cleaned there; T,
+    and sx = s"""
+    from spooky.methods import UPONewtonSolver
+    U = Series(seed=9)()[:2]
+    U[0] += 0.5                      # a mean, removed by fields()
+    loop = make_loop(solver)
+    params = loop.make(U, 7.7, 0.3)
+    big = make_solver(48)
+    fields, T, sx = loop.to_fields(params, big.grid)
+    assert (T, sx) == (7.7, 0.3)
+    assert [f.shape for f in fields] == [(48, 48)]*2
+    # The free loop's tau = 0 slice, projected on the big grid
+    k = np.fft.fftfreq(48, 1/48)
+    KX, KY = np.meshgrid(k, k, indexing='ij')
+    up = loop.snapshot(params, (48, 48))
+    G = np.fft.fft2(up)
+    assert np.abs(np.fft.ifft2(KX*G[0] + KY*G[1])).max() > 0.1
+    F = [np.fft.fft2(f) for f in fields]
+    assert np.abs(np.fft.ifft2(KX*F[0] + KY*F[1])).max() < 1e-12
+    for f in fields:
+        assert abs(f.mean()) < 1e-14
+    K2 = np.where(KX**2 + KY**2 > 0, KX**2 + KY**2, 1.0)
+    kG = (KX*G[0] + KY*G[1])/K2
+    proj = [np.fft.ifft2(G[0] - KX*kG).real, np.fft.ifft2(G[1] - KY*kG).real]
+    np.testing.assert_allclose(np.stack(fields), np.stack(proj), atol=1e-12)
+    # Default grid: the loop's own; and X for Newton
+    own, _, _ = loop.to_fields(params)
+    assert own[0].shape == (N, N)
+    newt = UPONewtonSolver(big, T, sx)
+    X = newt.form_X(newt.flatten(fields), T, sx)
+    assert X.shape == (2*48*48 + 2,) and (X[-2], X[-1]) == (7.7, 0.3)
+
+
+class Advection:
+    """A stand-in solver, du/dt = -c du/dx: every field g(x - c t, y) is an
+    exact traveling wave, a relative periodic orbit with any T and sx = c T"""
+    num_fields = 2
+
+    def __init__(self, n, c):
+        import spooky as sp
+        self.grid = sp.Grid2D(2*np.pi, 2*np.pi, n, n, 1e-3)
+        self.c = c
+
+    def rhs(self, fields):
+        return [-self.c*self.grid.deriv(f, self.grid.kx) for f in fields]
+
+    def load_fields(self, path, step):
+        return [np.load(os.path.join(path, f'{n}.{step:04}.npy')) for n in ('uu', 'vv')]
+
+
+def test_traveling_wave(tmp_path):
+    """The shift end to end: a window of a traveling wave, built with s =
+    c T, is an exact loop (from_window takes the snapshots to the comoving
+    frame); with -s it is not; to_fields hands over sx = s, and Newton's
+    equation translate(u(T), sx) = u(0) holds for the lab-frame u(T)"""
+    n, c, T, Nt = 24, 0.37, 2.0, 8
+    x = 2*np.pi*np.arange(n)/n
+    X, Y = np.meshgrid(x, x, indexing='ij')
+    # A divergence-free g from a stream function, u = dpsi/dy, v = -dpsi/dx
+    g = lambda X: [np.cos(X + 2*Y) + 1.5*np.sin(2*X - Y),
+                   -0.5*np.cos(X + 2*Y) + 3*np.sin(2*X - Y)]
+    for k in range(Nt):
+        u = g(X - c*T*k/Nt)
+        np.save(tmp_path/f'uu.{k:04}.npy', u[0])
+        np.save(tmp_path/f'vv.{k:04}.npy', u[1])
+    solver = Advection(n, c)
+    loop = make_loop(solver, Nt=Nt)
+    steps = list(range(Nt))
+    params = loop.from_window(str(tmp_path), steps, T, c*T)
+    assert float(loop.loss(params)[0]) < 1e-26
+    assert float(loop.loss(loop.from_window(str(tmp_path), steps, T, -c*T))[0]) > 0.1
+    fields, T_out, sx = loop.to_fields(params, solver.grid)
+    assert (T_out, sx) == (T, c*T)
+    np.testing.assert_allclose(np.stack(fields), np.stack(g(X)), atol=1e-12)
+    uT = solver.grid.translate(g(X - c*T), sx)
+    np.testing.assert_allclose(np.stack([np.asarray(f) for f in uT]),
+                               np.stack(fields), atol=1e-12)
+
+
+def test_resample_odd_sizes():
+    """Odd sizes keep every mode they can hold, |k| <= (n - 1)/2"""
+    from spooky.methods.fourier_loop import resample
+
+    def field(n, k):
+        x = 2*np.pi*np.arange(n)/n
+        X, Y = np.meshgrid(x, x, indexing='ij')
+        return np.cos(k*X) + np.sin(k*Y)
+    np.testing.assert_allclose(resample(field(32, 10), 21), field(21, 10), atol=1e-12)
+    np.testing.assert_allclose(resample(field(21, 10), 32), field(32, 10), atol=1e-12)
+
+
+def test_argument_checks(tmp_path, solver):
+    """plateau_iters must be a positive multiple of log_every; to_fields
+    needs the loop's domain"""
+    import spooky as sp
+    loop = make_loop(solver)
+    params = loop.make(Series(seed=1)()[:2], 7.7, 0.3)
+    for plateau_iters in (5, 15):
+        with pytest.raises(ValueError):
+            loop.optimize(params, str(tmp_path/'a'), max_iters=1, log_every=10,
+                          plateau_iters=plateau_iters, verbose=False)
+    with pytest.raises(ValueError):
+        loop.to_fields(params, sp.Grid2D(2*np.pi, np.pi, 48, 48, 1e-3))
