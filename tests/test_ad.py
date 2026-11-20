@@ -397,7 +397,8 @@ def test_run_orbit_frees_T_and_shift_kse(kse_setup):
 
     assert loss_f < loss0, f"Loss did not decrease: {loss0:.4e} -> {loss_f:.4e}"
     assert T != T0 and sx != sx0
-    assert 0.75 * T0 <= T <= 1.25 * T0
+    # T can land exactly on a bound; the x = T*sT rescale can put it one ulp outside
+    assert 0.75 * T0 * (1 - 1e-12) <= T <= 1.25 * T0 * (1 + 1e-12)
     assert info['history'][0][0] == pytest.approx(loss0, rel=1e-10)
     assert len(info['history']) == info['nit'] + 1
 
